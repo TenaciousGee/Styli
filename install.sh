@@ -1,20 +1,28 @@
 #!/bin/sh
-# Installs vinyltrack for the current user on Linux.
-#   - copies vinyltrack.py and vinyltrack_gui.py to ~/.local/share/vinyltrack/app
-#   - creates the `vt` command in ~/.local/bin
-#   - adds "Vinyl Cartridge / Stylus Tracker" to your applications menu
-# Run it from the folder containing the two .py files:  sh install.sh
+# Installs Styli for the current user on Linux.
+#   - copies styli.py, styli_gui.py and the styli.png icon to ~/.local/share/styli/app
+#   - creates the `styli` command (and `vt` as a short name) in ~/.local/bin
+#   - adds Styli to your applications menu
+#   - moves a library from the app's earlier name (vinyltrack) across, if there is one
+# Run it from the folder containing those three files:  sh install.sh
 set -e
 
 here="$(cd "$(dirname "$0")" && pwd)"
-dest="${XDG_DATA_HOME:-$HOME/.local/share}/vinyltrack/app"
+data="${XDG_DATA_HOME:-$HOME/.local/share}"
+dest="$data/styli/app"
 bin="$HOME/.local/bin"
 
 mkdir -p "$dest" "$bin"
-cp "$here/vinyltrack.py" "$here/vinyltrack_gui.py" "$dest/"
-chmod +x "$dest/vinyltrack.py" "$dest/vinyltrack_gui.py"
-ln -sf "$dest/vinyltrack.py" "$bin/vt"
-echo "Installed the vt command to $bin/vt"
+cp "$here/styli.py" "$here/styli_gui.py" "$dest/"
+if [ -f "$here/styli.png" ]; then
+  cp "$here/styli.png" "$dest/"
+else
+  echo "Note: styli.png wasn't found next to install.sh, so the menu will use a stock icon."
+fi
+chmod +x "$dest/styli.py" "$dest/styli_gui.py"
+ln -sf "$dest/styli.py" "$bin/styli"
+ln -sf "$dest/styli.py" "$bin/vt"
+echo "Installed the styli command to $bin/styli (vt still works too)"
 
 case ":$PATH:" in
   *":$bin:"*) ;;
@@ -31,5 +39,17 @@ else
   echo "  Arch/Manjaro:       sudo pacman -S python-pyqt6"
 fi
 
-python3 "$dest/vinyltrack.py" desktop-entry
-echo "Done. Open 'Vinyl Cartridge / Stylus Tracker' from your menu, or run: vt gui"
+# Adds the menu entry and icon, and on first run moves an existing library into Styli's folder.
+python3 "$dest/styli.py" desktop-entry
+
+# Remove the program files installed under the old name. Your data is only ever moved
+# by Styli itself, and the old folder is removed only if nothing else is left in it.
+old="$data/vinyltrack"
+if [ -d "$old/app" ]; then
+  rm -f "$old/app/vinyltrack.py" "$old/app/vinyltrack_gui.py"
+  rm -rf "$old/app/__pycache__"
+  rmdir "$old/app" 2>/dev/null || true
+  rmdir "$old" 2>/dev/null || true
+fi
+
+echo "Done. Open Styli from your menu, or run: styli gui"
