@@ -12,6 +12,24 @@ Needs PyQt6:  Debian/Ubuntu: sudo apt install python3-pyqt6
               Others:        pip install PyQt6
 Qt 6.5 or newer is needed for "Match my desktop" to follow theme changes live.
 
+Everything the window does with your library goes through styli.py (handed over as `core`), so
+the window and the `styli` command always agree. This file only draws and arranges things.
+
+How this file is organised (each section starts with a note on what it does):
+  Look and feel                 colours, light and dark themes, tints, the stylesheet
+  Building blocks               labels, buttons, tables, sorting helpers
+  Drawing                       covers and the placeholder record
+  Background work               downloads and lookups without freezing the window
+  Showing covers and photos     cover squares, list rows, cartridge photos
+  Cartridge / stylus cards      the cards above the tabs
+  Main window                   the tabs and the album panel
+  When a play happened          the date and time picker for logging plays
+  Charts for the Stats tab      lifetime, per-period and weekly heatmap charts
+  Stats tab layout              chart cards you can reorder
+  Top 10 tab                    the grid of covers that flip over
+  Dialogs                       Add record, Preferences, cartridges / styli and more
+  Start-up                      opening the window
+
 Licence: MIT. Share freely.
 """
 
@@ -41,6 +59,12 @@ ROLE = Qt.ItemDataRole.UserRole
 
 # ---------------------------------------------------------------------------
 # Look and feel
+#
+# Colours and the stylesheet. The light and dark palettes (LIGHT, DARK) can be given a tint: 16
+# pastel hues, pure black or pure white, with shades checked for readable contrast.
+#
+# apply_theme fills C, the current colours that every widget and chart reads as it paints, and the
+# QSS stylesheet styles widgets by their object name (for example QPushButton#primary).
 # ---------------------------------------------------------------------------
 
 DARK = {
@@ -77,11 +101,13 @@ TINT_HUES = {k: h for k, _, h in TINTS}
 
 
 def hsl(h, s, l, alpha=None):
+    """A colour from hue (0-360), saturation and lightness (0-100) as #rrggbb, or #aarrggbb with alpha."""
     c = QColor.fromHslF((h % 360) / 360.0, max(0.0, min(1.0, s / 100.0)), max(0.0, min(1.0, l / 100.0)))
     return c.name() if alpha is None else "#{:02x}{}".format(alpha, c.name()[1:])
 
 
 def _luminance(hexc):
+    """How bright a colour looks to the eye (WCAG relative luminance), for contrast checks."""
     hexc = hexc[-6:]
     r, g, b = (int(hexc[i:i + 2], 16) / 255 for i in (0, 2, 4))
     f = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4  # noqa: E731
@@ -301,6 +327,8 @@ def arrow_image(colour, up=False):
 
 
 def apply_theme(app, pref="system", tint="original"):
+    """Switch the whole app to light or dark (or the desktop's choice) with a colour tint. Returns True when the
+    result is dark."""
     dark = pref == "dark" or (pref == "system" and system_is_dark(app))
     C.clear()
     C.update(DARK if dark else LIGHT)
@@ -328,7 +356,16 @@ def apply_theme(app, pref="system", tint="original"):
     return dark
 
 
+# ---------------------------------------------------------------------------
+# Building blocks
+#
+# Small helpers for making consistently styled widgets, table cells that sort by a hidden key
+# (dates, names without "The"), long titles that can wrap, the track listing grid, and the sort
+# orders offered by the library and Discogs lists.
+# ---------------------------------------------------------------------------
+
 def label(text="", name=None, wrap=False):
+    """A text label, optionally styled by name (e.g. 'muted', 'caption') and wrapping."""
     w = QLabel(text)
     if name:
         w.setObjectName(name)
@@ -337,6 +374,7 @@ def label(text="", name=None, wrap=False):
 
 
 def button(text, slot=None, name=None):
+    """A push button wired to slot, optionally styled by name (e.g. 'primary', 'ghost')."""
     b = QPushButton(text)
     if name:
         b.setObjectName(name)
@@ -347,6 +385,7 @@ def button(text, slot=None, name=None):
 
 
 def card():
+    """A rounded panel, the background for most groups of controls."""
     f = QFrame()
     f.setObjectName("card")
     return f
@@ -363,6 +402,7 @@ def restyle(widget, name=None, **props):
 
 
 def table(headers, stretch_col):
+    """A read-only table that selects whole rows, with column stretch_col taking spare width."""
     t = QTableWidget(0, len(headers))
     t.setHorizontalHeaderLabels(headers)
     t.verticalHeader().setVisible(False)
@@ -415,6 +455,7 @@ def breakable(text, chunk=14):
 
 
 def make_splitter(main):
+    """The draggable divider between a list and the album panel (its position is remembered)."""
     split = QSplitter(Qt.Orientation.Horizontal)
     split.setChildrenCollapsible(False)
     split.setHandleWidth(18)
@@ -447,6 +488,7 @@ def fill_track_grid(grid, tracks, lengths):
 
 
 def make_track_grid():
+    """An empty grid for a track listing (filled by fill_track_grid). Returns (widget, grid)."""
     box = QWidget()
     grid = QGridLayout(box)
     grid.setContentsMargins(0, 0, 0, 0)
@@ -473,6 +515,7 @@ class SortItem(QTableWidgetItem):
     """A table cell that sorts by a hidden key (dates by date, lengths by seconds, names ignoring 'The')."""
 
     def __lt__(self, other):
+        """Compare by the hidden sort key when there is one, otherwise by the text."""
         a, b = self.data(SORT_ROLE), other.data(SORT_ROLE)
         if a is None or b is None:
             return super().__lt__(other)
@@ -480,6 +523,7 @@ class SortItem(QTableWidgetItem):
 
 
 def cell(text, data=None, key=None):
+    """A table cell with optional hidden data and sort key."""
     it = SortItem(str(text))
     if data is not None:
         it.setData(ROLE, data)
@@ -524,6 +568,7 @@ def sort_records(items, how):
 
 
 def sort_combo(options, current, changed):
+    """A 'Sort by' drop-down; changed(key) is called with the chosen order."""
     box = QComboBox()
     for key, text in options:
         box.addItem(text, key)
@@ -535,6 +580,9 @@ def sort_combo(options, current, changed):
 
 # ---------------------------------------------------------------------------
 # Drawing: covers and the placeholder record
+#
+# Covers are drawn with rounded corners. When there's no cover, a record (or a cartridge) is drawn
+# instead, coloured from the album's title so each one looks different.
 # ---------------------------------------------------------------------------
 
 def draw_vinyl(p, rect, seed):
@@ -627,14 +675,20 @@ def draw_cover(p, rect, pm, seed, radius, placeholder="vinyl", fit=False):
 
 # ---------------------------------------------------------------------------
 # Background work (MusicBrainz and cover downloads never freeze the window)
+#
+# Anything slow (web lookups, downloads) runs in a thread pool. run_task hands the result back to
+# the window's thread. CoverStore loads covers as they're needed, most important first, and drops
+# queued previews you've scrolled past.
 # ---------------------------------------------------------------------------
 
 class _Signals(QObject):
+    """How a background task hands its result (or error) back to the window's thread."""
     done = pyqtSignal(object)
     failed = pyqtSignal(object)
 
 
 class _Task(QRunnable):
+    """Runs one function in the background thread pool, so the window never freezes during a download."""
     def __init__(self, fn):
         super().__init__()
         self.fn = fn
@@ -643,6 +697,7 @@ class _Task(QRunnable):
         self.setAutoDelete(False)
 
     def run(self):
+        """Run the function and report back: done with the result, or failed with the error."""
         self.started = True
         try:
             result, ok = self.fn(), True
@@ -655,6 +710,8 @@ class _Task(QRunnable):
 
 
 def run_task(fn, done, failed, keep, pool=None, priority=0):
+    """Run fn in the background, then call done(result) or failed(error) back in the window. keep holds the task
+    until it finishes; higher priority runs sooner."""
     task = _Task(fn)
     keep.add(task)
 
@@ -723,15 +780,18 @@ class CoverStore(QObject):
         self.changed.emit()
 
     def forget_previews(self):
+        """Drop cached search previews from memory (after the preview cache is cleared)."""
         for store in (self.pix,):
             for k in [k for k in store if k[0] != "record"]:
                 del store[k]
         self.missing = {k for k in self.missing if k[0] == "record"}
 
     def loading(self, key):
+        """True while a cover is still downloading."""
         return key in self.pending
 
     def _done(self, key, result):
+        """A cover arrived (or didn't): remember it and repaint whatever is showing it."""
         path, rgid = result
         self.pending.discard(key)
         self.queued.pop(key, None)
@@ -751,7 +811,15 @@ class CoverStore(QObject):
         self.missing = {k for k in self.missing if not (k[0] == "record" and k[1] == rid)}
 
 
+# ---------------------------------------------------------------------------
+# Showing covers and photos
+#
+# Widgets that show a cover or photo: the album panel's cover, the rows of the record lists (drawn
+# by RowDelegate), cartridge / stylus photos and the hours-by-month bars.
+# ---------------------------------------------------------------------------
+
 class CoverWidget(QWidget):
+    """A square that shows one album cover, or a drawn record while there isn't one."""
     def __init__(self, store, size, placeholder="vinyl", fit=False):
         super().__init__()
         self.store, self.key, self.seed, self.placeholder, self.fit = store, None, "", placeholder, fit
@@ -759,6 +827,7 @@ class CoverWidget(QWidget):
         store.changed.connect(self.update)
 
     def show_cover(self, key, seed=""):
+        """Show the cover for key (a CoverStore key); seed picks the placeholder's colours."""
         self.key, self.seed = key, seed
         self.update()
 
@@ -785,6 +854,7 @@ class RowDelegate(QStyledItemDelegate):
         return QSize(240, self.height)
 
     def paint(self, p, option, index):
+        """Draw one row: rounded highlight, cover, title and subtitle, and two lines on the right."""
         d = index.data(ROLE) or {}
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -830,6 +900,7 @@ class RowDelegate(QStyledItemDelegate):
 
 
 def make_list(store, height=72):
+    """A list of records drawn by RowDelegate, rows height pixels tall."""
     lst = QListWidget()
     lst.setItemDelegate(RowDelegate(store, lst, height))
     lst.setMouseTracking(True)
@@ -848,10 +919,12 @@ class PhotoStore(QObject):
         self.cache = {}
 
     def key(self, sid):
+        """A key for a cartridge / stylus photo that changes when the photo file changes."""
         path = core.stylus_photo_path(sid)
         return ("stylus", sid, path.stat().st_mtime if path.exists() else 0)
 
     def get(self, key, priority=0):
+        """The photo for key, loaded from disk the first time it's asked for."""
         if not key or not key[2]:
             return None
         pm = self.cache.get(key)
@@ -860,9 +933,11 @@ class PhotoStore(QObject):
         return None if pm.isNull() else pm
 
     def loading(self, key):
+        """Photos load straight from disk, so never 'loading' (matches CoverStore's interface)."""
         return False
 
     def updated(self):
+        """A photo was added or changed: repaint everything showing one."""
         self.changed.emit()
 
 
@@ -875,6 +950,7 @@ class PixmapWidget(QWidget):
         self.setFixedSize(size, size)
 
     def set_pixmap(self, pm, note=""):
+        """Show an image, or a note when there isn't one."""
         self.pm, self.note = pm, note
         self.update()
 
@@ -897,6 +973,7 @@ class MonthBars(QWidget):
         self.setMinimumHeight(130)
 
     def set_data(self, rows):
+        """Show the last 12 of (month, seconds) as bars; hidden when there's nothing played."""
         self.data = rows[-12:]
         self.setVisible(bool(rows))
         self.update()
@@ -930,6 +1007,13 @@ class MonthBars(QWidget):
                        "{:.1f}".format(secs / 3600))
         p.end()
 
+
+# ---------------------------------------------------------------------------
+# Cartridge / stylus cards
+#
+# One card per cartridge / stylus in use, shown above the tabs, with its wear bar. Clicking one puts
+# it on the turntable.
+# ---------------------------------------------------------------------------
 
 class StylusCard(QFrame):
     """One cartridge / stylus in use: photo, wear bar and hours. Click to put it on the turntable."""
@@ -983,14 +1067,24 @@ class StylusCard(QFrame):
         restyle(self, current="true" if current else "false")
 
     def mousePressEvent(self, event):
+        """Clicking a card puts that cartridge / stylus on the turntable."""
         self.main.make_current(self.sid)
 
 
 # ---------------------------------------------------------------------------
 # Main window
+#
+# Builds the tabs and the album panel and keeps them up to date. Its parts, in order: building, the
+# resizable list and panel, the play log, sortable tables, the Stats and Top 10 tabs, refreshing,
+# library actions, the Discogs tab, album details, and History actions.
+#
+# After any change refresh_all reloads everything; the Stats and Top 10 tabs only redraw while
+# they're open, and catch up when they're next opened.
 # ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
+    """Styli's window: the cartridge / stylus cards along the top, then the tabs (Library, Discogs collection, Play
+    log, History, Stats, Top 10) and the album panel beside the lists."""
     def __init__(self, con):
         super().__init__()
         self.con, self.current, self.chips = con, None, {}
@@ -1044,6 +1138,7 @@ class MainWindow(QMainWindow):
 
     # ---- building ---------------------------------------------------------
     def _build_styli_area(self):
+        """The row of cartridge / stylus cards above the tabs, with Hide cards and Manage."""
         wrap = QWidget()
         v = QVBoxLayout(wrap)
         v.setContentsMargins(0, 0, 0, 0)
@@ -1076,6 +1171,7 @@ class MainWindow(QMainWindow):
         return wrap
 
     def toggle_strip(self):
+        """Hide or show the cartridge / stylus cards, and remember the choice."""
         hidden = self.strip_scroll.isVisibleTo(self.strip_scroll.parentWidget())
         core.set_setting(self.con, "strip_hidden", "1" if hidden else "0")
         self._apply_strip(hidden)
@@ -1090,17 +1186,20 @@ class MainWindow(QMainWindow):
 
     # ---- resizable list / panel ---------------------------------------------------
     def _split_stretch(self, split):
+        """When the window widens, share the extra width 3:2 between the list and the panel."""
         split.setStretchFactor(0, 3)  # extra width is shared: 3 parts to the list, 2 to the panel
         if split.count() > 1:
             split.setStretchFactor(1, 2)
 
     def _panel_fraction(self):
+        """The album panel's saved share of the width (kept between 20% and 60%)."""
         try:
             return min(0.6, max(0.2, float(core.get_setting(self.con, "panel_fraction", "0.34"))))
         except ValueError:
             return 0.34
 
     def _apply_panel_width(self, split):
+        """Set the divider so the panel has its saved share of the width."""
         total = split.width() - split.handleWidth()
         if total > 0 and split.count() > 1:
             right = int(total * self._panel_fraction())
@@ -1114,12 +1213,14 @@ class MainWindow(QMainWindow):
         self._apply_panel_width(split)
 
     def _panel_moved(self, split):
+        """The divider was dragged: save the panel's new share shortly after."""
         sizes = split.sizes()
         if len(sizes) > 1 and sum(sizes) > 0:
             self._pending_fraction = sizes[1] / float(sum(sizes))
             self.panel_save_timer.start()
 
     def _save_panel_width(self):
+        """Save the album panel's share of the width."""
         if getattr(self, "_pending_fraction", None):
             core.set_setting(self.con, "panel_fraction", "{:.3f}".format(self._pending_fraction))
 
@@ -1130,6 +1231,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda: self._apply_panel_width(self.lib_split))
 
     def eventFilter(self, obj, event):
+        """Resize the album cover with the panel, and fit the Stats charts after a resize."""
         if obj is self.detail_scroll.viewport() and event.type() == QEvent.Type.Resize:
             self._fit_cover(event.size().width())
         elif getattr(self, "st_scroll", None) is not None and obj is self.st_scroll.viewport() \
@@ -1144,6 +1246,7 @@ class MainWindow(QMainWindow):
             self.cover.setFixedSize(side, side)
 
     def _build_library(self):
+        """The Library tab: search box, sort order and Add record, the record list, and the panel."""
         page = QWidget()
         h = QHBoxLayout(page)
         h.setContentsMargins(0, 14, 0, 0)
@@ -1178,6 +1281,8 @@ class MainWindow(QMainWindow):
         return page
 
     def _build_detail(self):
+        """The album panel shared by the Library and Discogs tabs: cover, sides to log, when, which cartridge /
+        stylus, Log play, and the album's summary and tracks."""
         outer = card()
         outer.setMinimumWidth(372)  # drag the divider to make it wider; it also grows with the window
         outer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -1267,6 +1372,7 @@ class MainWindow(QMainWindow):
 
     # ---- play log ---------------------------------------------------------------
     def _build_playlog(self):
+        """The Play log tab: one row each time a play was logged, with Remove."""
         page = QWidget()
         v = QVBoxLayout(page)
         v.setContentsMargins(0, 14, 0, 0)
@@ -1297,6 +1403,7 @@ class MainWindow(QMainWindow):
         return page
 
     def refresh_playlog(self):
+        """Reload the Play log table."""
         self.plog_groups = core.play_log(self.con, limit=500)
         t = self.plog
         t.setRowCount(len(self.plog_groups))
@@ -1320,6 +1427,7 @@ class MainWindow(QMainWindow):
             " (the latest 500)" if len(self.plog_groups) == 500 else "") if total else "No plays logged yet.")
 
     def remove_selected_logs(self):
+        """Remove the plays selected in the Play log (after asking)."""
         rows = sorted({i.row() for i in self.plog.selectedIndexes()})
         if not rows:
             QMessageBox.information(self, "Play log", "Select the plays to remove first.")
@@ -1350,6 +1458,7 @@ class MainWindow(QMainWindow):
         hh.sortIndicatorChanged.connect(lambda c, o, tt=t: self._sort_changed(tt, c, o))
 
     def _sort_changed(self, t, col, order):
+        """A column header was clicked: sort by it and remember the order (the Remove column doesn't sort)."""
         if col == t.property("unsortable"):  # the Remove column: keep the current sort
             t.horizontalHeader().blockSignals(True)
             t.horizontalHeader().setSortIndicator(t.property("sort_col"), Qt.SortOrder.DescendingOrder
@@ -1363,10 +1472,12 @@ class MainWindow(QMainWindow):
         self._resort(t)
 
     def _resort(self, t):
+        """Sort a table again by its saved column and direction after it's reloaded."""
         order = Qt.SortOrder.DescendingOrder if t.property("sort_order") == "desc" else Qt.SortOrder.AscendingOrder
         t.sortItems(t.property("sort_col"), order)
 
     def remove_logs(self, groups, ask=True):
+        """Remove logged plays (asking first unless ask is False), then refresh everything."""
         if ask:
             if len(groups) == 1:
                 g = groups[0]
@@ -1389,6 +1500,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _msg_link(self, link):
+        """A link in a message was clicked: 'undo:<log id>' removes the play just logged."""
         if link.startswith("undo:"):
             log_id = int(link.split(":", 1)[1])
             ids = [r[0] for r in self.con.execute("SELECT id FROM plays WHERE log_id = ?", (log_id,))]
@@ -1399,6 +1511,7 @@ class MainWindow(QMainWindow):
             restyle(self.d_msg, "muted")
 
     def _build_history(self):
+        """The History tab: every side played, filtered by cartridge / stylus, with delete and export."""
         page = QWidget()
         v = QVBoxLayout(page)
         v.setContentsMargins(0, 14, 0, 0)
@@ -1427,6 +1540,8 @@ class MainWindow(QMainWindow):
 
     # ---- stats: lifetime charts and the weekly heatmap ----------------------------
     def _build_stats(self):
+        """The Stats tab: cartridge / stylus picker, sides or hours, grouping, four summary boxes and the three
+        reorderable charts, all fitted to the window height."""
         self.stats_sid = None  # None: follow the cartridge / stylus on the turntable
         self.stats_dirty = True
         self.stats_measure = core.get_setting(self.con, "stats_measure", "sides")
@@ -1513,6 +1628,7 @@ class MainWindow(QMainWindow):
 
     # ---- top 10: the most played albums as a grid of covers ----------------------
     def _build_top(self):
+        """The Top 10 tab: period picker and the grid of album covers."""
         self.top_dirty = True
         page = QWidget()
         v = QVBoxLayout(page)
@@ -1550,6 +1666,7 @@ class MainWindow(QMainWindow):
         return page
 
     def _top_period(self, i):
+        """A Top 10 period was chosen: remember it and redraw."""
         core.set_setting(self.con, "top_period", self.top_period.itemData(i))
         self.refresh_top(force=True)
 
@@ -1584,17 +1701,21 @@ class MainWindow(QMainWindow):
             sub.setVisible(not compact and bool(sub.text()))
 
     def _stats_pick(self, i):
+        """A cartridge / stylus was picked on the Stats tab (picking the one on the turntable means 'follow the
+        turntable' again)."""
         sid = self.st_combo.itemData(i)
         cur = core.active_stylus(self.con)
         self.stats_sid = None if cur and sid == cur["id"] else sid
         self.refresh_stats(force=True)
 
     def _stats_measure(self, b):
+        """Sides played or Hours was chosen: remember it and redraw the charts."""
         self.stats_measure = b.property("key")
         core.set_setting(self.con, "stats_measure", self.stats_measure)
         self.refresh_stats(force=True)
 
     def _stats_unit(self, i):
+        """Grouping by day, week, month or automatically was chosen: remember it and redraw."""
         core.set_setting(self.con, "stats_unit", self.st_unit.itemData(i) or "")
         self.refresh_stats(force=True)
 
@@ -1684,6 +1805,7 @@ class MainWindow(QMainWindow):
 
     # ---- refreshing --------------------------------------------------------
     def refresh_all(self):
+        """Reload everything after a change: cards, lists, tables, charts and Top 10."""
         self.refresh_status()
         self.refresh_library()
         self.refresh_history()
@@ -1733,9 +1855,12 @@ class MainWindow(QMainWindow):
         self.refresh_history_filter()
 
     def record_cover_key(self, r):
+        """The CoverStore key for a library record's cover (artist and title let hand-entered records be matched to
+        an album)."""
         return ("record", r["id"], r["mbid"], r["rgid"], 500, r["cover_url"], r["artist"], r["title"])
 
     def refresh_library(self):
+        """Reload the record list in the chosen order, keeping the selection."""
         keep = self.lib_sel
         lst = self.lib_list
         lst.blockSignals(True)
@@ -1777,17 +1902,20 @@ class MainWindow(QMainWindow):
                 self.show_detail(None)
 
     def _set_lib_sort(self, how):
+        """A library sort order was chosen: remember it and reload the list."""
         self.lib_sort = how
         core.set_setting(self.con, "sort_library", how)
         self.refresh_library()
 
     def apply_filter(self):
+        """Hide records that don't match every word typed in the search box."""
         words = self.filter.text().lower().split()
         for i in range(self.lib_list.count()):
             item = self.lib_list.item(i)
             item.setHidden(bool(words) and not all(w in item.data(ROLE)["search"] for w in words))
 
     def refresh_history_filter(self):
+        """Refill the History tab's cartridge / stylus drop-down."""
         f = self.hist_filter
         keep = f.currentData()
         f.blockSignals(True)
@@ -1801,12 +1929,14 @@ class MainWindow(QMainWindow):
         f.blockSignals(False)
 
     def show_stylus_plays(self, sid):
+        """Open the History tab showing only one cartridge / stylus's plays."""
         self.refresh_history_filter()
         self.hist_filter.setCurrentIndex(max(0, self.hist_filter.findData(sid)))
         self.tabs.setCurrentWidget(self.hist_page)
         self.refresh_history()
 
     def refresh_history(self):
+        """Reload the History table (up to 2,000 sides)."""
         sid = self.hist_filter.currentData() if hasattr(self, "hist_filter") else None
         where, params = ("WHERE p.stylus_id = ?", [sid]) if sid is not None else ("", [])
         rows = self.con.execute(
@@ -1828,16 +1958,19 @@ class MainWindow(QMainWindow):
 
     # ---- library actions ---------------------------------------------------
     def on_select(self, item):
+        """A record was selected in the library list: show it in the panel."""
         rid = item.data(ROLE)["id"] if item is not None else None
         self.lib_sel = rid
         if self.view == "library" and rid != self.current:
             self.show_detail(rid)
 
     def _clear_chips(self):
+        """Remove the side buttons from the panel."""
         clear_layout(self.chips_grid)
         self.chips = {}
 
     def _set_chips(self, sides):
+        """One toggle button per side (all on to start), two to a row."""
         self._clear_chips()
         for i, s in enumerate(sides):
             text = "Side {}   {}".format(s["label"], core.fmt_dur(s["seconds"]) if s["seconds"] else "?:??")
@@ -1855,6 +1988,7 @@ class MainWindow(QMainWindow):
         self.log_btn.setEnabled(bool(self.chips))
 
     def show_detail(self, rid, keep_msg=False, empty=None):
+        """Show a library record (or 'select a record') in the album panel."""
         self.current = rid
         self.pending = None
         if self.view == "library":
@@ -1887,6 +2021,7 @@ class MainWindow(QMainWindow):
         self.show_about_record(rec)
 
     def _level(self, sid=None):
+        """The wear level (ok, warn or over) of a cartridge / stylus, to spot a play crossing a level."""
         s = self.con.execute("SELECT * FROM styli WHERE id = ?", (sid,)).fetchone() if sid else \
             core.active_stylus(self.con)
         return core.stylus_summary(self.con, s)["level"] if s else None
@@ -1910,6 +2045,8 @@ class MainWindow(QMainWindow):
         self.refresh_stats()
 
     def do_log(self):
+        """Log play: record the chosen sides at the chosen time against the chosen cartridge / stylus, show an Undo
+        link, and warn if it has just passed its warning level or rated life."""
         if self.pending is not None:  # a Discogs record: add it to the library first
             if not self.save_pending():
                 return
@@ -1959,10 +2096,12 @@ class MainWindow(QMainWindow):
                 self.con, self.con.execute("SELECT * FROM styli WHERE id = ?", (stylus["id"],)).fetchone()))
 
     def _record(self):
+        """The record shown in the panel, or None."""
         return self.con.execute("SELECT * FROM records WHERE id = ?", (self.current,)).fetchone() \
             if self.current else None
 
     def edit_record(self):
+        """Edit the shown record's title, artist and sides."""
         if self.pending is not None:
             self.edit_pending()
             return
@@ -1980,6 +2119,7 @@ class MainWindow(QMainWindow):
             self.refresh_all()
 
     def set_cover(self):
+        """Choose your own image as the shown record's cover."""
         rec = self._record()
         if not rec:
             return
@@ -1997,6 +2137,7 @@ class MainWindow(QMainWindow):
         self.refresh_library()
 
     def remove_record(self):
+        """Remove the shown record from the library (after asking). Its plays are kept."""
         rec = self._record()
         if not rec:
             return
@@ -2012,10 +2153,12 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def _store_rgid(self, rid, rgid):
+        """Save an album id found while fetching a cover, so it isn't looked up again."""
         self.con.execute("UPDATE records SET rgid = ? WHERE id = ? AND rgid IS NULL", (rgid, rid))
         self.con.commit()
 
     def open_add(self):
+        """Open Add record, then select whatever was added."""
         dlg = AddDialog(self)
         dlg.exec()
         self.update_discogs_tab()
@@ -2027,6 +2170,7 @@ class MainWindow(QMainWindow):
 
     # ---- Discogs tab -----------------------------------------------------------
     def _build_discogs(self):
+        """The Discogs collection tab: filter, sort and refresh, the collection list, and the panel."""
         page = QWidget()
         row = QHBoxLayout(page)
         row.setContentsMargins(0, 14, 0, 0)
@@ -2087,6 +2231,7 @@ class MainWindow(QMainWindow):
             self.dgl.clear()
 
     def on_tab(self, idx):
+        """A tab was opened: move the album panel there if it uses one, and load anything it needs."""
         w = self.tabs.widget(idx)
         if w is self.lib_page:
             self.view = "library"
@@ -2128,6 +2273,7 @@ class MainWindow(QMainWindow):
                  self._dg_failed, self.tasks)
 
     def _dg_page(self, val, gen, page):
+        """One page of the Discogs collection arrived: keep it and ask for the next, or finish."""
         if gen != self.dg_gen:
             return
         batch, pages, total = val
@@ -2150,14 +2296,17 @@ class MainWindow(QMainWindow):
                  self._dg_failed, self.tasks)
 
     def _dg_failed(self, e):
+        """Downloading the Discogs collection failed: say why."""
         self.dg_refresh_btn.setEnabled(True)
         self._dg_status(str(e) if isinstance(e, core.MBError) else repr(e), "warn")
 
     def _dg_status(self, text, style="muted"):
+        """Set the message under the Discogs list."""
         self.dg_status.setText(text)
         restyle(self.dg_status, style)
 
     def _dg_count_status(self):
+        """Show how many records are in the collection and how many the filter shows."""
         _, user = core.discogs_account(self.con)
         n = len(self.dg_items)
         shown = len(self.dg_shown)
@@ -2173,6 +2322,7 @@ class MainWindow(QMainWindow):
         return {r["discogs_id"]: (r["id"], counts.get(r["id"], {"album": 0, "sides": 0, "last": None})) for r in rows}
 
     def _dg_row(self, n, i, lib):
+        """The list row for a collection item (marked when it's already in your library)."""
         fmt = i["format"].split(";")[0]
         if i["id"] in lib:
             c = lib[i["id"]][1]
@@ -2184,11 +2334,13 @@ class MainWindow(QMainWindow):
                 "meta": fmt if len(fmt) <= 24 else fmt[:23] + "...", "meta2": meta2}
 
     def _set_dg_sort(self, how):
+        """A Discogs sort order was chosen: remember it and refill the list."""
         self.dg_sort = how
         core.set_setting(self.con, "sort_discogs", how)
         self.fill_dg_list()
 
     def fill_dg_list(self):
+        """Fill the Discogs list, filtered and sorted, keeping the selection."""
         infos = [core.discogs_item_info(it) for it in self.dg_items]
         plays = self._dg_play_info()
         for i in infos:
@@ -2232,12 +2384,15 @@ class MainWindow(QMainWindow):
             item.setData(ROLE, self._dg_row(n, self.dg_shown[n], lib))
 
     def _dg_selected(self):
+        """The collection item selected in the Discogs list, or None."""
         item = self.dgl.currentItem()
         if item is None or not self.dg_shown:
             return None
         return self.dg_shown[item.data(ROLE)["i"]]
 
     def on_dg_select(self, keep_msg=False):
+        """A Discogs record was selected: show it from the library if it's there, otherwise fetch its sides and
+        show it ready to add or log."""
         i = self._dg_selected()
         if i is None:
             self.pending = None
@@ -2320,6 +2475,7 @@ class MainWindow(QMainWindow):
         self.show_about_pending(info)
 
     def edit_pending(self):
+        """Check or correct a Discogs record's sides before it's added."""
         info = self.pending
         dlg = SidesEditor(self, "Check the sides", info["artist"], info["title"] or "", info["year"],
                           [dict(s) for s in info["sides"]], " ".join(info["notes"]),
@@ -2335,6 +2491,7 @@ class MainWindow(QMainWindow):
         return True
 
     def add_pending_to_library(self):
+        """Add the shown Discogs record to the library without logging a play."""
         if self.pending is None:
             return
         title = self.pending["title"]
@@ -2370,6 +2527,7 @@ class MainWindow(QMainWindow):
 
     # ---- album details: summary and track listing -------------------------------
     def _build_about(self):
+        """The 'About this album' part of the panel: facts, summary, links, pressing notes, tracks."""
         box = QWidget()
         av = QVBoxLayout(box)
         av.setContentsMargins(0, 10, 0, 0)
@@ -2406,10 +2564,12 @@ class MainWindow(QMainWindow):
         return box
 
     def jump_to_about(self):
+        """Scroll the panel down to the album's summary."""
         bar = self.detail_scroll.verticalScrollBar()
         bar.setValue(min(bar.maximum(), self.about_box.y() - 12))
 
     def render_about(self, about, tracks, lengths, status="", can_refresh=False):
+        """Show an album's summary and track listing (grouped by side) in the panel."""
         about = about or {}
         self.about_box.setVisible(True)
         facts = []
@@ -2443,6 +2603,7 @@ class MainWindow(QMainWindow):
         self.ab_refresh.setVisible(can_refresh)
 
     def show_about_record(self, rec, error=None):
+        """Show what's saved about a library record, and fetch anything missing in the background."""
         token, _ = core.discogs_account(self.con)
         tracks = core.get_tracks(self.con, rec["id"])
         about = core.get_about(rec)
@@ -2535,9 +2696,11 @@ class MainWindow(QMainWindow):
             run_task(lambda: core.lookup_album_wikipedia(artist, title), done, failed, self.tasks)
 
     def open_prefs(self):
+        """Open Preferences."""
         PrefsDialog(self).exec()
 
     def set_theme(self, pref, save=True, tint=None):
+        """Apply a theme and tint, saving them unless it's only a preview."""
         self.theme_pref = pref
         if tint is not None:
             self.tint = tint
@@ -2548,6 +2711,7 @@ class MainWindow(QMainWindow):
             core.set_setting(self.con, "tint", self.tint)
 
     def follow_desktop(self, *args):
+        """The desktop switched between light and dark: follow it if set to match the desktop."""
         if self.theme_pref == "system":
             self.set_theme("system", save=False)
 
@@ -2563,11 +2727,13 @@ class MainWindow(QMainWindow):
         return n
 
     def open_styli(self):
+        """Open Manage cartridges / styli, then refresh everything."""
         StyliDialog(self).exec()
         self.refresh_all()
 
     # ---- history actions ----------------------------------------------------
     def delete_plays(self):
+        """Delete the sides selected in the History tab (after asking)."""
         rows = sorted({i.row() for i in self.hist.selectedIndexes()})
         if not rows:
             QMessageBox.information(self, "History", "Select the entries to delete first.")
@@ -2582,6 +2748,7 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def export_csv(self):
+        """Save every play as a CSV file."""
         path, _ = QFileDialog.getSaveFileName(self, "Export plays", str(Path.home() / "vinyl-plays.csv"),
                                               "CSV files (*.csv)")
         if not path:
@@ -2592,21 +2759,11 @@ class MainWindow(QMainWindow):
 
 
 # ---------------------------------------------------------------------------
-# Dialogs
-# ---------------------------------------------------------------------------
-
-def dialog_layout(dlg, title, min_width=None):
-    dlg.setWindowTitle(title)
-    if min_width:
-        dlg.setMinimumWidth(min_width)
-    v = QVBoxLayout(dlg)
-    v.setContentsMargins(22, 20, 22, 18)
-    v.setSpacing(12)
-    return v
-
-
-# ---------------------------------------------------------------------------
 # When a play happened: "Now", or a day and time picked on a calendar
+#
+# The When row in the album panel. It shows "Now" until you pick an earlier day and time on the
+# calendar, for logging plays after the event. Days you've already played records on are underlined,
+# and times that haven't happened yet can't be picked.
 # ---------------------------------------------------------------------------
 
 def calendar_icon(colour, size=16):
@@ -2632,6 +2789,7 @@ def calendar_icon(colour, size=16):
 
 
 def friendly_when(when):
+    """A play time as 'Today, 20:30', 'Yesterday, 20:30' or 'Sat 11 Oct 2026, 20:30'."""
     today = core.now_local().date()
     day = when.date()
     if day == today:
@@ -2722,17 +2880,21 @@ class WhenPopup(QFrame):
         super().keyPressEvent(event)
 
     def pick_now(self):
+        """Now: go back to logging plays at the current time."""
         self.picker.set_now()
         self.close()
 
     def pick_yesterday(self):
+        """Yesterday: select yesterday on the calendar."""
         self.cal.setSelectedDate(QDate.currentDate().addDays(-1))
 
     def chosen(self):
+        """The day and time picked, as a local datetime."""
         d, t = self.cal.selectedDate(), self.time.time()
         return dt.datetime(d.year(), d.month(), d.day(), t.hour(), t.minute()).astimezone()
 
     def done_clicked(self):
+        """Use the picked time, unless it's in the future."""
         when = self.chosen()
         now = core.now_local()
         if when > now:
@@ -2768,22 +2930,27 @@ class WhenPicker(QWidget):
         self._render()
 
     def when(self):
+        """When the play happened: the time picked, or now."""
         return self.value or core.now_local()
 
     def is_now(self):
+        """True when no earlier time has been picked."""
         return self.value is None
 
     def set_now(self):
+        """Go back to 'Now'."""
         self.value = None
         self._render()
         self.changed.emit()
 
     def set_value(self, when):
+        """Use an earlier time (to the minute)."""
         self.value = when.replace(second=0, microsecond=0)
         self._render()
         self.changed.emit()
 
     def _render(self):
+        """Update the button: 'Now', or the time picked (outlined so it stands out)."""
         self.btn.setIcon(calendar_icon(C["accent"] if self.value else C["muted"]))
         self.btn.setText("  Now" if self.value is None else "  " + friendly_when(self.value))
         self.btn.setProperty("past", self.value is not None)
@@ -2797,6 +2964,7 @@ class WhenPicker(QWidget):
         super().changeEvent(event)
 
     def open_popup(self):
+        """Open the calendar just below the button (or above it near the bottom of the screen)."""
         self.popup = WhenPopup(self, core.play_dates(self.con))
         self.popup.adjustSize()
         pos = self.btn.mapToGlobal(QPoint(0, self.btn.height() + 4))
@@ -2812,6 +2980,10 @@ class WhenPicker(QWidget):
 
 # ---------------------------------------------------------------------------
 # Charts for the Stats tab (drawn with QPainter, coloured from the theme)
+#
+# The running total over a cartridge / stylus's life, totals per day, week or month, and the weekly
+# heatmap. They share the window's height, show fewer gridlines when short, and give exact figures
+# in a tooltip as you move over them.
 # ---------------------------------------------------------------------------
 
 def nice_ticks(top, count=4):
@@ -2837,16 +3009,19 @@ def mix(a, b, t):
 
 
 def faded(colour, alpha):
+    """A theme colour made partly see-through (alpha 0-255)."""
     c = QColor(colour)
     c.setAlpha(alpha)
     return c
 
 
 def measure_value(measure, sides, seconds):
+    """Sides played, or hours, depending on what the Stats tab is showing."""
     return sides if measure == "sides" else seconds / 3600.0
 
 
 def fmt_measure(measure, value, short=False):
+    """A value as '12 sides' or '3.4 hours' ('12' or '3.4 h' when short, for axis labels)."""
     if measure == "sides":
         n = int(round(value))
         return str(n) if short else "{} side{}".format(n, "" if n == 1 else "s")
@@ -2859,6 +3034,7 @@ PERIOD_NAMES = {"day": "day", "week": "week", "month": "month"}
 
 
 def period_label(start, unit, long=False):
+    """A day, week or month for chart labels ('6 Oct') and tooltips ('Week of 6 Oct 2026')."""
     if unit == "month":
         return start.strftime("%B %Y" if long else "%b %Y")
     if unit == "week":
@@ -2894,6 +3070,7 @@ def date_ticks(start, end, width):
 
 
 class ChartBase(QWidget):
+    """What the Stats charts share: margins, the y axis and gridlines, hover tooltips and empty messages."""
     LEFT, RIGHT, TOP, BOTTOM = 52, 14, 18, 24
 
     def __init__(self, min_height=110, preferred=240):
@@ -2912,12 +3089,14 @@ class ChartBase(QWidget):
         return QSize(600, self.minimumHeight())
 
     def small_font(self, bold=False):
+        """The slightly smaller font used for axis labels."""
         f = QFont(self.font())
         f.setPointSizeF(max(7.5, f.pointSizeF() * 0.86))
         f.setBold(bold)
         return f
 
     def plot_rect(self):
+        """The area inside the axes where data is drawn."""
         return QRectF(self.LEFT, self.TOP, max(10, self.width() - self.LEFT - self.RIGHT),
                       max(10, self.height() - self.TOP - self.BOTTOM))
 
@@ -2932,6 +3111,7 @@ class ChartBase(QWidget):
         super().leaveEvent(event)
 
     def draw_y_axis(self, p, r, ticks, top):
+        """Horizontal gridlines with their values down the left."""
         p.setFont(self.small_font())
         for v in ticks:
             y = r.bottom() - r.height() * v / top
@@ -2942,10 +3122,12 @@ class ChartBase(QWidget):
                        fmt_measure(self.measure, v, short=True))
 
     def draw_empty(self, p):
+        """A centred message when there's nothing to draw."""
         p.setPen(QColor(C["muted"]))
         p.drawText(QRectF(self.rect()), Qt.AlignmentFlag.AlignCenter, self.empty)
 
     def show_tip(self, event, text):
+        """Show a tooltip by the mouse pointer."""
         QToolTip.showText(event.globalPosition().toPoint(), text, self)
 
 
@@ -2957,10 +3139,12 @@ class CumulativeChart(ChartBase):
         self.t = None
 
     def set_data(self, t, measure):
+        """Show a timeline from core.stylus_timeline as sides or hours."""
         self.t, self.measure, self.hover = t, measure, None
         self.update()
 
     def _series(self):
+        """The running totals as (when, value) in the current measure."""
         t = self.t
         return [(w, measure_value(self.measure, s, sec)) for w, s, sec in t["points"]]
 
@@ -2981,11 +3165,14 @@ class CumulativeChart(ChartBase):
         return ticks, lines
 
     def _x(self, r, when):
+        """The x position of a moment in time."""
         t = self.t
         span = max(1.0, (t["end"] - t["start"]).total_seconds())
         return r.left() + r.width() * (when - t["start"]).total_seconds() / span
 
     def paintEvent(self, event):
+        """Draw the gridlines, date labels, the stepped running total with its shading, the wear lines (in Hours),
+        and the hover marker."""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         if not self.t:
@@ -3038,6 +3225,7 @@ class CumulativeChart(ChartBase):
         p.end()
 
     def mouseMoveEvent(self, event):
+        """Show the running total at the date under the pointer."""
         if not self.t:
             return
         r = self.plot_rect()
@@ -3064,16 +3252,21 @@ class PeriodChart(ChartBase):
         self.t = None
 
     def set_data(self, t, measure):
+        """Show a timeline from core.stylus_timeline as sides or hours."""
         self.t, self.measure, self.hover = t, measure, None
         self.update()
 
     def _values(self):
+        """Each period's total in the current measure."""
         return [measure_value(self.measure, b["sides"], b["seconds"]) for b in self.t["buckets"]]
 
     def _slot(self, r):
+        """The width each bar (and the gap beside it) gets."""
         return r.width() / max(1, len(self.t["buckets"]))
 
     def paintEvent(self, event):
+        """Draw the gridlines, a bar per period (rounded at the top), the labels along the bottom and the Peak
+        label on the busiest bar."""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         if not self.t or not self.t["buckets"]:
@@ -3131,6 +3324,7 @@ class PeriodChart(ChartBase):
         p.end()
 
     def mouseMoveEvent(self, event):
+        """Highlight the bar under the pointer and show its period and total."""
         if not self.t or not self.t["buckets"]:
             return
         r = self.plot_rect()
@@ -3170,22 +3364,27 @@ class HeatmapChart(ChartBase):
         return max(self.MIN_ROW, min(self.MAX_ROW, (self.height() - self.TOP - self.BOTTOM) / 7.0))
 
     def set_data(self, grid, measure):
+        """Show a grid from core.play_heatmap as sides or hours."""
         self.grid, self.measure, self.hover = grid, measure, None
         self.update()
 
     def _value(self, d, h):
+        """One hour's total in the current measure."""
         c = self.grid[d][h]
         return measure_value(self.measure, c[0], c[1])
 
     def _cell(self):
+        """The width of each hour's square."""
         return (self.width() - self.LEFT - self.RIGHT) / 24.0
 
     def colour(self, v, top):
+        """A square's colour: empty for none, then from faint to the full accent colour at the busiest hour."""
         if v <= 0:
             return QColor(C["surface2"])
         return mix(C["surface3"], C["accent"], 0.22 + 0.78 * v / top)
 
     def paintEvent(self, event):
+        """Draw the hour labels, a row of squares for each day with its total, and the key."""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         if not self.grid:
@@ -3240,6 +3439,7 @@ class HeatmapChart(ChartBase):
         p.end()
 
     def mouseMoveEvent(self, event):
+        """Outline the square under the pointer and show that hour's plays."""
         if not self.grid:
             return
         cw = self._cell()
@@ -3262,7 +3462,10 @@ class HeatmapChart(ChartBase):
 
 
 # ---------------------------------------------------------------------------
-# Stats tab: chart cards you can drag (or nudge with the arrows) into any order
+# Stats tab layout: chart cards you can drag (or nudge with the arrows) into any order
+#
+# Each chart sits in a ChartCard; ReorderBox holds the cards in a column. Drag a card by its dotted
+# handle, or use its arrows, and the new order is saved.
 # ---------------------------------------------------------------------------
 
 CARD_MIME = "application/x-styli-chart"
@@ -3334,6 +3537,8 @@ class ElidedLabel(QLabel):
 
 
 class ChartCard(QFrame):
+    """One chart on the Stats tab in its card: drag handle, title, up and down arrows, a one-line explanation and
+    the chart itself."""
     def __init__(self, key, chart, box):
         super().__init__()
         self.setObjectName("card")
@@ -3388,19 +3593,23 @@ class ReorderBox(QWidget):
         self.dragging = None
 
     def add(self, card):
+        """Add a chart card at the bottom."""
         self.cards.append(card)
         self.lay.addWidget(card, card.chart.preferred)
         self._refresh_buttons()
 
     def order(self):
+        """The cards' keys from top to bottom (saved as the stats_order setting)."""
         return [c.key for c in self.cards]
 
     def set_order(self, keys):
+        """Put the cards in a saved order (unknown keys go last)."""
         rank = {k: i for i, k in enumerate(keys)}
         self.cards.sort(key=lambda c: rank.get(c.key, len(rank)))
         self._relayout()
 
     def _relayout(self):
+        """Re-add the cards in their current order, each stretching in proportion to its chart."""
         for c in self.cards:
             self.lay.removeWidget(c)
         for c in self.cards:
@@ -3408,6 +3617,7 @@ class ReorderBox(QWidget):
         self._refresh_buttons()
 
     def _refresh_buttons(self):
+        """Arrow icons in the theme's colours; the top card can't go up or the bottom one down."""
         up, down = QIcon(arrow_image(C["muted"], up=True)), QIcon(arrow_image(C["muted"]))
         for i, c in enumerate(self.cards):
             c.up.setIcon(up)
@@ -3416,6 +3626,7 @@ class ReorderBox(QWidget):
             c.down.setEnabled(i < len(self.cards) - 1)
 
     def move_card(self, card, index):
+        """Move a card to a new position, and tell the window so the order is saved."""
         old = self.cards.index(card)
         index = max(0, min(len(self.cards) - 1, index))
         if index == old:
@@ -3425,9 +3636,11 @@ class ReorderBox(QWidget):
         self.moved.emit(self.order())
 
     def step(self, card, delta):
+        """Move a card one place up (-1) or down (+1)."""
         self.move_card(card, self.cards.index(card) + delta)
 
     def start_drag(self, card):
+        """Start dragging a card: a faded picture of it follows the pointer until it's dropped."""
         drag = QDrag(card)
         mime = QMimeData()
         mime.setData(CARD_MIME, card.key.encode("utf-8"))
@@ -3459,6 +3672,7 @@ class ReorderBox(QWidget):
         return len(self.cards)
 
     def _show_marker(self, index):
+        """The accent line showing where a dragged card will land."""
         if index < len(self.cards):
             y = self.cards[index].geometry().top() - 9
         else:
@@ -3480,6 +3694,7 @@ class ReorderBox(QWidget):
         self.marker.hide()
 
     def dropEvent(self, event):
+        """A card was dropped: move it to where the marker showed."""
         self.marker.hide()
         key = bytes(event.mimeData().data(CARD_MIME)).decode("utf-8")
         card = next((c for c in self.cards if c.key == key), None)
@@ -3494,6 +3709,12 @@ class ReorderBox(QWidget):
 
 # ---------------------------------------------------------------------------
 # Top 10 tab: a grid of covers that flip over to show each album's stats
+#
+# TopGrid lays the albums out up to five across, wrapping onto more rows as the window narrows.
+# Clicking a cover turns it over to show that album's stats; only one is turned over at a time.
+#
+# The grid fits its height just after each resize, never during one, which would start another
+# resize.
 # ---------------------------------------------------------------------------
 
 class AlbumTile(QWidget):
@@ -3518,10 +3739,12 @@ class AlbumTile(QWidget):
         store.changed.connect(self.update)
 
     def _set_p(self, v):
+        """Animation step: how far the cover has turned (0 = cover, 1 = stats)."""
         self.p = float(v)
         self.update()
 
     def set_flipped(self, on, animate=True):
+        """Turn the cover over to show the stats (or back), animated unless asked not to be."""
         if on == self.flipped:
             return
         self.flipped = on
@@ -3545,6 +3768,7 @@ class AlbumTile(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, event):
+        """A click turns the cover over (TopGrid makes sure only one is turned)."""
         if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
             self.clicked.emit(self)
 
@@ -3563,6 +3787,8 @@ class AlbumTile(QWidget):
         super().focusOutEvent(event)
 
     def paintEvent(self, event):
+        """Draw the tile: squashed sideways as it turns, the front or back depending on how far it has turned, then
+        the title and artist underneath."""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -3599,6 +3825,7 @@ class AlbumTile(QWidget):
         p.end()
 
     def paint_front(self, p, r):
+        """The front: the album cover with its rank in a badge."""
         rec = self.item["record"]
         draw_cover(p, r, self.store.get(self.key), rec["title"], 12, "vinyl", False)
         d = max(26.0, min(44.0, r.width() * 0.15))
@@ -3614,6 +3841,7 @@ class AlbumTile(QWidget):
         p.drawText(badge, Qt.AlignmentFlag.AlignCenter, str(self.rank))
 
     def paint_back(self, p, r):
+        """The back: the album's stats, as many rows as fit, and its plays over the last 12 months."""
         s, rec = self.stats, self.item["record"]
         path = QPainterPath()
         path.addRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 12, 12)
@@ -3703,6 +3931,7 @@ class TopGrid(QWidget):
         self._height_timer.timeout.connect(self._fit_height)
 
     def set_tiles(self, tiles):
+        """Replace the albums shown (all of them show their covers to start)."""
         for t in self.tiles:
             t.hide()
             t.setParent(None)
@@ -3726,13 +3955,16 @@ class TopGrid(QWidget):
         self.open = tile
 
     def columns(self, width=None):
+        """How many albums fit across: as many 200 pixel tiles as fit, up to five."""
         width = self.width() if width is None else width
         return max(1, min(self.MAX_COLS, int((width + self.GAP) // (self.MIN_TILE + self.GAP))))
 
     def _side(self, width, n):
+        """The width of each tile for n columns."""
         return max(40, int((width - self.GAP * (n - 1)) / n))
 
     def heightForWidth(self, width):
+        """The height the grid needs at a given width (every row, with captions and gaps)."""
         if not self.tiles:
             return 0
         n = self.columns(width)
@@ -3766,8 +3998,28 @@ class TopGrid(QWidget):
             self.setFixedHeight(h)
 
     def resizeEvent(self, event):
+        """Place the tiles for the new width."""
         super().resizeEvent(event)
         self.relayout()
+
+
+# ---------------------------------------------------------------------------
+# Dialogs
+#
+# Add record (search MusicBrainz or pick from your Discogs collection), checking a record's sides,
+# linking Discogs, Preferences, managing cartridges / styli, editing one, and finding its photo and
+# specifications online.
+# ---------------------------------------------------------------------------
+
+def dialog_layout(dlg, title, min_width=None):
+    """Title a dialog and give it the standard margins. Returns its main layout."""
+    dlg.setWindowTitle(title)
+    if min_width:
+        dlg.setMinimumWidth(min_width)
+    v = QVBoxLayout(dlg)
+    v.setContentsMargins(22, 20, 22, 18)
+    v.setSpacing(12)
+    return v
 
 
 class SidesEditor(QDialog):
@@ -3810,6 +4062,7 @@ class SidesEditor(QDialog):
         v.addLayout(row)
 
     def add_row(self, side="", length="", tracks=0, missing=0):
+        """Add a side to the table. Returns its row number."""
         r = self.table.rowCount()
         self.table.insertRow(r)
         self.table.setItem(r, 0, cell(side, {"orig": length, "tracks": tracks, "missing": missing}))
@@ -3824,6 +4077,7 @@ class SidesEditor(QDialog):
         return r
 
     def add_next(self):
+        """Add the next unused side letter and start typing its length."""
         used = {(self.table.item(r, 0).text() or "").strip().upper() for r in range(self.table.rowCount())}
         nxt = next((core.side_letter(i) for i in range(40) if core.side_letter(i) not in used), "")
         r = self.add_row(nxt)
@@ -3831,10 +4085,12 @@ class SidesEditor(QDialog):
         self.table.editItem(self.table.item(r, 1))
 
     def remove_selected(self):
+        """Remove the selected sides."""
         for r in sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True):
             self.table.removeRow(r)
 
     def save(self):
+        """Check every side has a label and a valid length, then close with the result."""
         out, seen = [], set()
         try:
             for r in range(self.table.rowCount()):
@@ -4040,21 +4296,25 @@ class AddDialog(QDialog):
 
     # ---- helpers -----------------------------------------------------------
     def done(self, result):
+        """Mark the dialog closed so background results that arrive later are ignored."""
         self.closed = True
         self.press_gen += 1
         self.covers.cancel_queued()
         super().done(result)
 
     def _task(self, fn, ok):
+        """Run fn in the background and call ok with the result, unless the dialog has closed by then."""
         def alive(cb):
             return lambda val: None if self.closed else cb(val)
         run_task(fn, alive(ok), alive(self._failed), self.tasks)
 
     def _set_status(self, text, style="muted"):
+        """Set the message at the bottom of the dialog."""
         self.status.setText(text)
         restyle(self.status, style)
 
     def _set_busy(self, busy, text=None):
+        """Show or clear the busy state (pointer, message and buttons)."""
         self.busy = busy
         if busy:
             self.setCursor(Qt.CursorShape.BusyCursor)
@@ -4065,6 +4325,7 @@ class AddDialog(QDialog):
         self._buttons()
 
     def _buttons(self):
+        """Enable and label the buttons to suit the current step."""
         self.search_btn.setEnabled(not self.busy)
         if self.mode == "discogs":
             has = self.dg_list.currentItem() is not None and self.dg_stack.currentIndex() == 1
@@ -4078,11 +4339,13 @@ class AddDialog(QDialog):
         self.next_btn.setEnabled(has and not self.busy)
 
     def _failed(self, e):
+        """A lookup failed: say why."""
         self._set_busy(False, "")
         QMessageBox.warning(self, "Discogs" if isinstance(e, core.DiscogsError) else "MusicBrainz",
                             str(e) if isinstance(e, core.MBError) else repr(e))
 
     def _preview(self, key, title, sub, seed="", tracks=None):
+        """Show a cover, title and details (and tracks, when known) in the preview panel."""
         self.pcover.show_cover(key, seed or title)
         self.ptitle.setText(breakable(title))
         self.psub.setText(breakable(sub))
@@ -4105,6 +4368,7 @@ class AddDialog(QDialog):
         self.track_timer.start()
 
     def _render_tracks(self, tracks, lengths, source="", status=""):
+        """Show a track listing in the preview panel, with where it came from."""
         fill_track_grid(self.ptr_grid, tracks, lengths)
         self.ptr_caption.setVisible(True)
         self.ptr_box.setVisible(bool(tracks))
@@ -4116,6 +4380,7 @@ class AddDialog(QDialog):
         self.ptr_status.setVisible(bool(status))
 
     def _fetch_tracks(self):
+        """Fetch the track listing of the album or pressing being previewed, in the background."""
         key = self.track_key
         if key is None or key in self.track_cache or key in self.track_loading:
             return
@@ -4157,6 +4422,7 @@ class AddDialog(QDialog):
 
     # ---- searching -----------------------------------------------------------
     def search(self):
+        """Search MusicBrainz by barcode, or by artist and album."""
         artist, title, bc = self.artist.text().strip(), self.title.text().strip(), self.barcode.text().strip()
         if bc:
             self._set_busy(True, "Looking up the barcode...")
@@ -4170,6 +4436,7 @@ class AddDialog(QDialog):
                    lambda res: self._got_albums(res, bool(title)))
 
     def _got_albums(self, albums, had_title):
+        """Albums found: list them with their covers."""
         self.albums = albums
         lst = self.album_list
         lst.blockSignals(True)
@@ -4198,6 +4465,7 @@ class AddDialog(QDialog):
         self._set_busy(False, "{} matches, best first. Pick yours and click Open album.{}".format(len(albums), extra))
 
     def show_albums(self):
+        """Back to the album list."""
         self.mode = self.mb_mode = "albums"
         self.press_gen += 1  # stop loading pressings of an album we've left
         self.stack.setCurrentIndex(0)
@@ -4205,6 +4473,7 @@ class AddDialog(QDialog):
         self._buttons()
 
     def preview_album(self):
+        """Preview the selected album: cover, details and, shortly after, its tracks."""
         item = self.album_list.currentItem()
         if item is None:
             self._preview(None, "", "Album art appears here when you pick an album.")
@@ -4219,6 +4488,7 @@ class AddDialog(QDialog):
 
     def open_album(self, g):
         # Thumbnails still waiting to download would only slow this down, so drop them.
+        """List the pressings of an album so you can pick the one you own."""
         self.covers.cancel_queued()
         self.track_timer.stop()
         self.album, self.pressings, self.press_total = g, [], 0
@@ -4246,6 +4516,7 @@ class AddDialog(QDialog):
             self._task(lambda: core.list_pressings_page(g["id"], nxt), lambda v: self._got_page(v, g, gen, nxt))
 
     def _got_barcode(self, items):
+        """Releases with the barcode found: list them as pressings."""
         self._set_busy(False)
         if not items:
             self._set_status("No release on MusicBrainz has that barcode. Try the artist and album.", "warn")
@@ -4255,6 +4526,7 @@ class AddDialog(QDialog):
         self.show_pressings()
 
     def show_pressings(self):
+        """Show the pressing list."""
         self.mode = self.mb_mode = "pressings"
         self.stack.setCurrentIndex(1)
         self.back_btn.setVisible(bool(self.albums) and self.album is not None)
@@ -4264,6 +4536,7 @@ class AddDialog(QDialog):
         self.refilter()
 
     def refilter(self, *args):
+        """Filter the pressings by the words typed and the vinyl-only switch."""
         if self.mode != "pressings":
             return
         row = self.press_table.currentRow()
@@ -4308,6 +4581,7 @@ class AddDialog(QDialog):
         self.preview_pressing()
 
     def preview_pressing(self):
+        """Preview the selected pressing: cover, label, catalogue number, barcode and tracks."""
         row = self.press_table.currentRow()
         if self.mode != "pressings" or not (0 <= row < len(self.shown)):
             self._buttons()
@@ -4327,6 +4601,7 @@ class AddDialog(QDialog):
 
     # ---- choosing --------------------------------------------------------------
     def next_step(self):
+        """The main button: open the album, or fetch the chosen pressing to check its sides and save."""
         if self.busy:
             return
         if self.mode == "discogs":
@@ -4353,6 +4628,7 @@ class AddDialog(QDialog):
         self._task(lambda: core.fetch_release(mbid), lambda rel: self._got_release(rel, mbid))
 
     def _got_release(self, rel, mbid):
+        """The chosen pressing arrived: open the sides editor to check and save it."""
         self._set_busy(False, "Check the side lengths, then Save.")
         sides = core.build_sides(rel, allow_prompt=False)
         notes, style = [], "muted"
@@ -4381,6 +4657,7 @@ class AddDialog(QDialog):
 
     # ---- Discogs ---------------------------------------------------------------
     def set_source(self, key):
+        """Switch between searching MusicBrainz and picking from your Discogs collection."""
         self.covers.cancel_queued()
         discogs = key == "discogs"
         self.mb_bar.setVisible(not discogs)
@@ -4401,10 +4678,12 @@ class AddDialog(QDialog):
         self._buttons()
 
     def link_discogs(self):
+        """Link a Discogs account, then load its collection."""
         if DiscogsLinkDialog(self, self.main).exec():
             self.load_discogs(refresh=True)
 
     def load_discogs(self, refresh=False):
+        """Load your Discogs collection (the saved copy straight away, downloading when it's old)."""
         token, user = core.discogs_account(self.con)
         self.dg_refresh.setEnabled(bool(token))
         if not token:
@@ -4451,6 +4730,7 @@ class AddDialog(QDialog):
                    lambda v: self._got_dg_page(v, gen, page + 1))
 
     def fill_discogs(self):
+        """Fill the Discogs list, filtered, keeping the selection."""
         cur = self.dg_list.currentItem()
         keep = self.dg_shown[cur.data(ROLE)["i"]]["id"] if cur is not None and self.dg_shown else None
         infos = [core.discogs_item_info(it) for it in self.dg_items]
@@ -4478,6 +4758,7 @@ class AddDialog(QDialog):
         self.preview_discogs()
 
     def preview_discogs(self):
+        """Preview the selected Discogs record."""
         item = self.dg_list.currentItem()
         if item is None or not self.dg_shown:
             self._preview(None, "", "Nothing matches the filter." if self.dg_items else "")
@@ -4494,6 +4775,7 @@ class AddDialog(QDialog):
         self._buttons()
 
     def use_discogs(self):
+        """Fetch the chosen Discogs record's sides (unless it's already in the library)."""
         item = self.dg_list.currentItem()
         if item is None or not self.dg_shown:
             return
@@ -4509,6 +4791,7 @@ class AddDialog(QDialog):
         self._task(lambda: core.prepare_discogs_release(token, i["id"]), self._got_discogs_release)
 
     def _got_discogs_release(self, info):
+        """The Discogs record's sides arrived: open the sides editor to check and save it."""
         self._set_busy(False, "Check the side lengths, then Save.")
         notes = list(info["notes"])
         warn = any(s["missing"] for s in info["sides"]) or info["estimated"] or not info["sides"]
@@ -4528,6 +4811,7 @@ class AddDialog(QDialog):
 
 
     def manual(self):
+        """Enter a record by hand: title, artist and side lengths."""
         dlg = SidesEditor(self, "Enter a record", self.artist.text().strip(), self.title.text().strip(), "", [],
                           "Type the side lengths from the sleeve or label.")
         if dlg.exec():
@@ -4576,10 +4860,12 @@ class DiscogsLinkDialog(QDialog):
         v.addLayout(bottom)
 
     def done(self, result):
+        """Mark the dialog closed so a token check that finishes later is ignored."""
         self.closed = True
         super().done(result)
 
     def link(self):
+        """Check the pasted token with Discogs, then save it (in the system keyring if there is one)."""
         token = self.token.text().strip()
         if not token:
             self.status.setText("Paste your token first.")
@@ -4741,6 +5027,7 @@ class PrefsDialog(QDialog):
         outer.addLayout(bottom)
 
     def _show_discogs(self):
+        """Show whether a Discogs account is linked and where its token is kept."""
         token, user = core.discogs_account(self.main.con)
         if token:
             text = "Linked as {}. Your collection has its own Discogs tab. {}".format(
@@ -4755,10 +5042,12 @@ class PrefsDialog(QDialog):
         self.dg_unlink_btn.setVisible(bool(token or core.DISCOGS_PROBLEM))
 
     def link_discogs(self):
+        """Link (or relink) a Discogs account."""
         if DiscogsLinkDialog(self, self.main).exec():
             self._show_discogs()
 
     def unlink_discogs(self):
+        """Unlink the Discogs account, removing its token (after asking)."""
         if QMessageBox.question(self, "Unlink Discogs", "Unlink your Discogs account? The access token is removed "
                                 "from this computer. Records you've already added stay in your library."
                                 ) == QMessageBox.StandardButton.Yes:
@@ -4767,19 +5056,23 @@ class PrefsDialog(QDialog):
             self._show_discogs()
 
     def _choice(self):
+        """The theme chosen: system, light or dark."""
         b = self.group.checkedButton()
         return b.property("key") if b else "system"
 
     def preview(self, btn, checked):
+        """Preview a theme as soon as it's chosen."""
         if checked:
             self.main.set_theme(self._choice(), save=False)
             self._style_swatches()
 
     def _tint_choice(self):
+        """The colour tint chosen."""
         b = self.tints.checkedButton()
         return b.property("key") if b else "original"
 
     def preview_tint(self, key):
+        """Preview a tint as soon as it's chosen."""
         self.main.set_theme(self._choice(), save=False, tint=key)
         self._style_swatches()
 
@@ -4794,27 +5087,32 @@ class PrefsDialog(QDialog):
         self.tint_name.setText(TINT_NAMES.get(self._tint_choice(), ""))
 
     def fetch_missing(self):
+        """Fetch covers for every library record that doesn't have one yet."""
         n = self.main.prefetch_covers()
         self.cover_msg.setText("Fetching {} cover{} in the background. They appear as they arrive.".format(
             n, "" if n == 1 else "s") if n else "Every album already has its cover saved, or none is available.")
 
     def _show_cache(self):
+        """Show how much space cover previews use."""
         mb = core.search_cache_size() / (1024 * 1024)
         self.cache_label.setText("Cover previews from searches are kept for a while so browsing is quicker. "
                                  "They use {:.1f} MB. Your albums' own covers are not affected by clearing them."
                                  .format(mb))
 
     def clear_cache(self):
+        """Delete the cover previews (your albums' own covers are kept)."""
         self.main.covers.cancel_queued()
         core.clear_search_cache()
         self.main.covers.forget_previews()
         self._show_cache()
 
     def save(self):
+        """Keep the chosen theme and tint."""
         self.main.set_theme(self._choice(), save=True, tint=self._tint_choice())
         self.accept()
 
     def reject(self):
+        """Cancel: put back the theme and tint you had before previewing others."""
         self.main.set_theme(self.original, save=False, tint=self.original_tint)
         super().reject()
 
@@ -4934,6 +5232,7 @@ class StyliDialog(QDialog):
 
     # ---- list ----------------------------------------------------------------
     def refresh(self, select=None):
+        """Reload the list: in use first, then retired ones, most recently retired first."""
         select = select or self.sid
         cur = core.active_stylus(self.con)
         rows = self.con.execute("SELECT * FROM styli").fetchall()
@@ -4965,12 +5264,14 @@ class StyliDialog(QDialog):
         self.show_stylus(sel.data(ROLE)["id"] if sel is not None else None)
 
     def _changed(self, select=None):
+        """Something changed: refresh the main window and this list, keeping a selection."""
         self.main.photos.updated()
         self.main.refresh_all()
         self.refresh(select)
 
     # ---- detail ---------------------------------------------------------------
     def show_stylus(self, sid):
+        """Show one cartridge / stylus's photo, wear, dates, specifications and hours by month."""
         self.sid = sid
         s = self.con.execute("SELECT * FROM styli WHERE id = ?", (sid,)).fetchone() if sid else None
         for w in (self.btn_use, self.btn_retire, self.btn_edit, self.btn_lookup, self.btn_photo, self.btn_plays,
@@ -5042,15 +5343,18 @@ class StyliDialog(QDialog):
             url, C["accent"], QUrl(url).host() or url) if url else "")
 
     def _row(self):
+        """The selected cartridge / stylus, or None."""
         return self.con.execute("SELECT * FROM styli WHERE id = ?", (self.sid,)).fetchone() if self.sid else None
 
     # ---- actions ----------------------------------------------------------------
     def put_on(self):
+        """Put the selected cartridge / stylus on the turntable."""
         if self.sid:
             core.stylus_use(self.con, self.sid)
             self._changed(self.sid)
 
     def retire(self):
+        """Retire the selected cartridge / stylus (after asking). Its plays are kept."""
         s = self._row()
         if s and QMessageBox.question(self, "Retire cartridge / stylus", "Retire {}? Its {} of plays stay in your history."
                                       .format(s["name"], core.fmt_hours(core.stylus_used_seconds(self.con, s)))
@@ -5059,6 +5363,7 @@ class StyliDialog(QDialog):
             self._changed(s["id"])
 
     def delete(self):
+        """Delete the selected cartridge / stylus, only possible if nothing was played with it."""
         s = self._row()
         if s and QMessageBox.question(self, "Delete cartridge / stylus", "Delete {}? Use this only for a cartridge / stylus added by "
                                       "mistake.".format(s["name"])) == QMessageBox.StandardButton.Yes:
@@ -5067,6 +5372,7 @@ class StyliDialog(QDialog):
             self._changed()
 
     def add(self):
+        """Fit a new cartridge / stylus (optionally retiring the one it replaces)."""
         dlg = StylusEditor(self, None, core.styli_in_use(self.con))
         if not dlg.exec():
             return
@@ -5081,6 +5387,7 @@ class StyliDialog(QDialog):
             self.lookup()
 
     def edit(self):
+        """Edit the selected cartridge / stylus's details."""
         s = self._row()
         if not s:
             return
@@ -5095,6 +5402,7 @@ class StyliDialog(QDialog):
             self._changed(s["id"])
 
     def lookup(self):
+        """Find a photo and specifications for the selected cartridge / stylus online."""
         s = self._row()
         if not s:
             return
@@ -5110,6 +5418,7 @@ class StyliDialog(QDialog):
         self._changed(s["id"])
 
     def choose_photo(self):
+        """Use your own photo of the selected cartridge / stylus."""
         s = self._row()
         if not s:
             return
@@ -5124,6 +5433,7 @@ class StyliDialog(QDialog):
         self._changed(s["id"])
 
     def show_plays(self):
+        """Show the selected cartridge / stylus's plays in the History tab."""
         if self.sid:
             self.main.show_stylus_plays(self.sid)
             self.accept()
@@ -5229,10 +5539,12 @@ class StylusEditor(QDialog):
         v.addLayout(row)
 
     def done(self, result):
+        """Mark the dialog closed so a page read that finishes later is ignored."""
         self.closed = True
         super().done(result)
 
     def _page_status(self, text, style="muted"):
+        """Set the message under the product page link."""
         self.page_status.setText(text)
         restyle(self.page_status, style)
 
@@ -5266,6 +5578,8 @@ class StylusEditor(QDialog):
         run_task(work, lambda found: None if self.closed else self.fill_from_page(found), failed, self.tasks)
 
     def fill_from_page(self, found):
+        """Fill in fields from a product page: empty ones, and ones it filled before. Never overwrites your own
+        typing."""
         if self.url.text().strip() != self.fetched_url:
             return  # the link was changed while we were reading
         filled = []
@@ -5312,6 +5626,7 @@ class StylusEditor(QDialog):
                               "table.".format(found["source"]), "warn")
 
     def save(self):
+        """Check the details and close with them."""
         name = self.name.text().strip()
         if not name:
             QMessageBox.warning(self, "Cartridge / stylus", "Give the cartridge / stylus a name.")
@@ -5393,10 +5708,12 @@ class LookupDialog(QDialog):
             self.search()
 
     def done(self, result):
+        """Mark the dialog closed so a lookup that finishes later is ignored."""
         self.closed = True
         super().done(result)
 
     def _run(self, fn, text):
+        """Run a lookup in the background (downloading its photo too), then show the result."""
         def work():
             found = fn()
             if found and found.get("image_url"):
@@ -5421,6 +5738,7 @@ class LookupDialog(QDialog):
         run_task(work, ok, failed, self.tasks)
 
     def _busy(self, busy):
+        """Show or clear the busy state."""
         self.busy = busy
         self.search_btn.setEnabled(not busy)
         self.read_btn.setEnabled(not busy)
@@ -5430,15 +5748,18 @@ class LookupDialog(QDialog):
             self.unsetCursor()
 
     def _status(self, text, style="muted"):
+        """Set the message at the bottom of the dialog."""
         self.status.setText(text)
         restyle(self.status, style)
 
     def search(self):
+        """Look the cartridge up on Wikipedia."""
         q = self.q.text().strip()
         if q:
             self._run(lambda: core.lookup_wikipedia(q), "Searching Wikipedia...")
 
     def read_page(self):
+        """Read a manufacturer's or shop's product page."""
         url = self.url.text().strip()
         if not url:
             self._status("Paste a link to a product page first.", "warn")
@@ -5448,6 +5769,7 @@ class LookupDialog(QDialog):
         self._run(lambda: core.scrape_product_page(url), "Reading the page...")
 
     def show_result(self, found):
+        """Show what was found: photo, description and specifications you can edit."""
         self.found = found
         has = bool(found)
         if found is None and not self.busy and self.status.text().startswith("Searching"):
@@ -5485,6 +5807,7 @@ class LookupDialog(QDialog):
                              "them in, or type them into the table.".format("a photo and " if not pm.isNull() else ""))
 
     def use(self):
+        """Save the photo and specifications shown to the cartridge / stylus."""
         if not self.found:
             return
         specs = {self.table.item(i, 0).data(ROLE): (self.table.item(i, 1).text() or "").strip()
@@ -5500,6 +5823,9 @@ class LookupDialog(QDialog):
 
 # ---------------------------------------------------------------------------
 # Start-up
+#
+# Sets the theme and icon and opens the window. styli.py calls run() for `styli gui`; running this
+# file directly does the same.
 # ---------------------------------------------------------------------------
 
 def app_icon():
@@ -5516,6 +5842,7 @@ def app_icon():
 
 
 def run(con, core_module):
+    """Start the window: theme, icon and main window. Returns when the window is closed."""
     global core
     core = core_module
     global SYSTEM_PALETTE

@@ -2,6 +2,9 @@
 """
 Styli: log vinyl plays by side and track cartridge / stylus hours.
 
+This file is Styli's engine and its command line (`styli ...`). The window
+(styli_gui.py) uses the same functions, so both always agree.
+
 Record and side running times are fetched automatically from MusicBrainz
 (https://musicbrainz.org), which lists vinyl track positions such as A1, A2,
 B1 so each side can be timed separately.
@@ -18,6 +21,22 @@ Data is kept in a single SQLite file:
 Override with the STYLI_DB environment variable or --db. A library kept under
 the app's earlier name (vinyltrack) is moved across automatically.
 `vt` works as a short name for the `styli` command.
+
+How this file is organised (each section starts with a note on what it does):
+  Where things are kept, and small helpers   folders, dates, durations, prompts
+  Privacy                                    private folders, the system keyring
+  Database                                   the SQLite library, play counts, Top 10
+  MusicBrainz                                finding albums and pressings, timing sides
+  Album art                                  saving covers, matching albums by name
+  Finding records, and wear                  records by name, the cartridge in use
+  Core actions                               logging and removing plays, cartridges
+  Cartridges / styli                         which are in use, per-cartridge stats
+  Lifetime charts and the weekly heatmap     the numbers behind the Stats tab
+  Cartridge photo and specifications         Wikipedia and product pages
+  Discogs                                    your collection as a source of records
+  Album details                              summaries and track listings
+  Commands                                   one function per `styli` sub-command
+  Command-line interface                     the options, and main()
 
 Licence: MIT. Share freely.
 """
@@ -43,7 +62,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 MB_ROOT = "https://musicbrainz.org/ws/2"
 # MusicBrainz asks every client to send a meaningful User-Agent with contact
 # details. Set STYLI_CONTACT to your email or a project URL.
@@ -59,10 +78,17 @@ DATA_DIR = None  # folder holding the database; set by connect()
 
 
 # --------------------------------------------------------------------------
-# Small helpers
+# Where things are kept, and small helpers
+#
+# Where the library and caches live on each system, moving a library across from the app's earlier
+# name (vinyltrack), and small helpers for dates, durations and questions at the terminal.
+#
+# Play times are stored as ISO text with the local time zone (e.g. 2026-10-18T20:30:00+01:00), so
+# they read back exactly as they were logged.
 # --------------------------------------------------------------------------
 
 def data_base():
+    """The folder where each operating system keeps app data (Styli's library lives inside it)."""
     if sys.platform.startswith("win"):
         return Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
     if sys.platform == "darwin":
@@ -71,6 +97,7 @@ def data_base():
 
 
 def cache_base():
+    """The folder where each operating system keeps disposable caches (cover previews, search results)."""
     if sys.platform.startswith("win"):
         return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
     if sys.platform == "darwin":
@@ -78,8 +105,133 @@ def cache_base():
     return Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
 
 
+def default_db_path():
+    """Where the library database lives, unless STYLI_DB or --db says otherwise."""
+    env = os.environ.get("STYLI_DB") or os.environ.get("VINYLTRACK_DB")
+    if env:
+        return Path(env).expanduser()
+    return data_base() / "styli" / "styli.db"
+
+
+def migrate_old_library():
+    """Move a library kept under the app's earlier name into Styli's folder.
+
+    Only runs when there is an old library and no Styli library yet, so nothing is
+    ever overwritten. Returns a message describing the move, or None.
+    """
+    if os.environ.get("STYLI_DB") or os.environ.get("VINYLTRACK_DB"):
+        return None
+    old, new = data_base() / OLD_NAME, data_base() / "styli"
+    old_db = old / (OLD_NAME + ".db")
+    if not old_db.exists() or (new / "styli.db").exists():
+        return None
+    new.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        src = old / (OLD_NAME + ".db" + suffix)
+        if src.exists():
+            shutil.move(str(src), str(new / ("styli.db" + suffix)))
+    for sub, dest in (("covers", "covers"), ("styli", "cartridges")):
+        if (old / sub).is_dir() and not (new / dest).exists():
+            shutil.move(str(old / sub), str(new / dest))
+    shutil.rmtree(str(cache_base() / OLD_NAME), ignore_errors=True)  # only downloaded previews
+    return "Moved your library to {}".format(new)
+
+def now_local():
+    """The current time in the local time zone, to the second (how play times are stored)."""
+    return dt.datetime.now().astimezone().replace(microsecond=0)
+
+
+def to_dt(iso):
+    """Turn a stored ISO timestamp back into a datetime, assuming local time if it has no zone."""
+    d = dt.datetime.fromisoformat(iso)
+    return d if d.tzinfo else d.astimezone()
+
+
+def fmt_dur(sec):
+    """Seconds as m:ss, or h:mm:ss for an hour or more."""
+    sec = int(round(sec or 0))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return "{}:{:02d}:{:02d}".format(h, m, s) if h else "{}:{:02d}".format(m, s)
+
+
+def fmt_hours(sec):
+    """Seconds as hours to one decimal place, e.g. '12.3 h'."""
+    return "{:.1f} h".format((sec or 0) / 3600)
+
+
+def parse_duration(text):
+    """Accepts '21:34', '1:02:10' or plain minutes such as '21.5'."""
+    text = text.strip()
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        return int(round(float(text) * 60))
+    parts = text.split(":")
+    if not all(p.isdigit() for p in parts) or len(parts) not in (2, 3):
+        raise ValueError("Use mm:ss, h:mm:ss or minutes, e.g. 21:34")
+    nums = [int(p) for p in parts]
+    if len(nums) == 2:
+        return nums[0] * 60 + nums[1]
+    return nums[0] * 3600 + nums[1] * 60 + nums[2]
+
+
+def parse_when(text):
+    """'2026-10-11 20:30', '2026-10-11', 'yesterday 21:00', 'today 9:15'."""
+    if not text:
+        return now_local()
+    t = text.strip().lower()
+    for word, offset in (("yesterday", 1), ("today", 0)):
+        if t.startswith(word):
+            day = dt.date.today() - dt.timedelta(days=offset)
+            rest = t[len(word):].strip()
+            clock = dt.time.fromisoformat(rest.zfill(5)) if rest else dt.time(12, 0)
+            return dt.datetime.combine(day, clock).astimezone().replace(microsecond=0)
+    try:
+        d = dt.datetime.fromisoformat(text.strip())
+    except ValueError:
+        raise ValueError("Could not read date/time '{}'. Try 2026-10-11 20:30".format(text))
+    return (d if d.tzinfo else d.astimezone()).replace(microsecond=0)
+
+
+def interactive():
+    """True when there's a person at the terminal to answer questions (and --yes wasn't given)."""
+    return sys.stdin.isatty() and not ASSUME_YES
+
+
+def ask(prompt, default=""):
+    """Ask a question at the terminal; Enter (or no terminal) gives the default."""
+    try:
+        ans = input(prompt).strip()
+    except EOFError:
+        ans = ""
+    return ans or default
+
+
+def confirm(prompt, default=True):
+    """Ask a yes/no question. Without a terminal, --yes means yes, otherwise the default is used."""
+    if not interactive():
+        return True if ASSUME_YES else default
+    hint = "[Y/n]" if default else "[y/N]"
+    ans = ask("{} {} ".format(prompt, hint)).lower()
+    if not ans:
+        return default
+    return ans.startswith("y")
+
+
+def err(msg):
+    """Print an error message for the command line."""
+    print("Error: " + msg, file=sys.stderr)
+
+
 # --------------------------------------------------------------------------
 # Privacy: folders only you can read, and secrets kept in the system keyring
+#
+# On Linux and Mac, Styli's folders and files are made readable by your user account only (Windows
+# already keeps each person's AppData private).
+#
+# Secrets (the Discogs access token) go in the system keyring through the optional keyring package:
+# GNOME Keyring or KWallet on Linux, Keychain on a Mac, Credential Manager on Windows. Without a
+# keyring they're kept in the database, which is private to you. Each library has its own keyring
+# entry, so a copied database never carries the token with it.
 # --------------------------------------------------------------------------
 
 def private_files():
@@ -134,6 +286,7 @@ def system_keyring():
 
 
 class SecretError(Exception):
+    """The system keyring has a saved secret but couldn't be read (locked, refused or missing)."""
     pass
 
 
@@ -153,6 +306,7 @@ def secret_store(con, name):
 
 
 def _forget_in_database(con, name):
+    """Remove a secret from the settings table, overwriting it rather than leaving it in free space."""
     con.execute("PRAGMA secure_delete = ON")  # overwrite it, rather than leave it in free space
     con.execute("DELETE FROM settings WHERE key = ?", (name,))
     con.commit()
@@ -193,6 +347,7 @@ def get_secret(con, name):
 
 
 def delete_secret(con, name):
+    """Forget a secret wherever it's kept: the system keyring and the database."""
     if secret_store(con, name) == "keyring":
         kr = system_keyring()
         if kr:
@@ -205,116 +360,15 @@ def delete_secret(con, name):
     con.commit()
 
 
-def default_db_path():
-    env = os.environ.get("STYLI_DB") or os.environ.get("VINYLTRACK_DB")
-    if env:
-        return Path(env).expanduser()
-    return data_base() / "styli" / "styli.db"
-
-
-def migrate_old_library():
-    """Move a library kept under the app's earlier name into Styli's folder.
-
-    Only runs when there is an old library and no Styli library yet, so nothing is
-    ever overwritten. Returns a message describing the move, or None.
-    """
-    if os.environ.get("STYLI_DB") or os.environ.get("VINYLTRACK_DB"):
-        return None
-    old, new = data_base() / OLD_NAME, data_base() / "styli"
-    old_db = old / (OLD_NAME + ".db")
-    if not old_db.exists() or (new / "styli.db").exists():
-        return None
-    new.mkdir(parents=True, exist_ok=True)
-    for suffix in ("", "-wal", "-shm", "-journal"):
-        src = old / (OLD_NAME + ".db" + suffix)
-        if src.exists():
-            shutil.move(str(src), str(new / ("styli.db" + suffix)))
-    for sub, dest in (("covers", "covers"), ("styli", "cartridges")):
-        if (old / sub).is_dir() and not (new / dest).exists():
-            shutil.move(str(old / sub), str(new / dest))
-    shutil.rmtree(str(cache_base() / OLD_NAME), ignore_errors=True)  # only downloaded previews
-    return "Moved your library to {}".format(new)
-
-def now_local():
-    return dt.datetime.now().astimezone().replace(microsecond=0)
-
-
-def to_dt(iso):
-    d = dt.datetime.fromisoformat(iso)
-    return d if d.tzinfo else d.astimezone()
-
-
-def fmt_dur(sec):
-    sec = int(round(sec or 0))
-    h, rem = divmod(sec, 3600)
-    m, s = divmod(rem, 60)
-    return "{}:{:02d}:{:02d}".format(h, m, s) if h else "{}:{:02d}".format(m, s)
-
-
-def fmt_hours(sec):
-    return "{:.1f} h".format((sec or 0) / 3600)
-
-
-def parse_duration(text):
-    """Accepts '21:34', '1:02:10' or plain minutes such as '21.5'."""
-    text = text.strip()
-    if re.fullmatch(r"\d+(\.\d+)?", text):
-        return int(round(float(text) * 60))
-    parts = text.split(":")
-    if not all(p.isdigit() for p in parts) or len(parts) not in (2, 3):
-        raise ValueError("Use mm:ss, h:mm:ss or minutes, e.g. 21:34")
-    nums = [int(p) for p in parts]
-    if len(nums) == 2:
-        return nums[0] * 60 + nums[1]
-    return nums[0] * 3600 + nums[1] * 60 + nums[2]
-
-
-def parse_when(text):
-    """'2026-10-11 20:30', '2026-10-11', 'yesterday 21:00', 'today 9:15'."""
-    if not text:
-        return now_local()
-    t = text.strip().lower()
-    for word, offset in (("yesterday", 1), ("today", 0)):
-        if t.startswith(word):
-            day = dt.date.today() - dt.timedelta(days=offset)
-            rest = t[len(word):].strip()
-            clock = dt.time.fromisoformat(rest.zfill(5)) if rest else dt.time(12, 0)
-            return dt.datetime.combine(day, clock).astimezone().replace(microsecond=0)
-    try:
-        d = dt.datetime.fromisoformat(text.strip())
-    except ValueError:
-        raise ValueError("Could not read date/time '{}'. Try 2026-10-11 20:30".format(text))
-    return (d if d.tzinfo else d.astimezone()).replace(microsecond=0)
-
-
-def interactive():
-    return sys.stdin.isatty() and not ASSUME_YES
-
-
-def ask(prompt, default=""):
-    try:
-        ans = input(prompt).strip()
-    except EOFError:
-        ans = ""
-    return ans or default
-
-
-def confirm(prompt, default=True):
-    if not interactive():
-        return True if ASSUME_YES else default
-    hint = "[Y/n]" if default else "[y/N]"
-    ans = ask("{} {} ".format(prompt, hint)).lower()
-    if not ans:
-        return default
-    return ans.startswith("y")
-
-
-def err(msg):
-    print("Error: " + msg, file=sys.stderr)
-
-
 # --------------------------------------------------------------------------
 # Database
+#
+# One SQLite file holds everything: records and their sides, track listings, every side played,
+# cartridges / styli, and settings. connect() creates it and quietly adds anything newer versions
+# need, so older libraries keep working.
+#
+# Also here: play counts (a full album play is every side played once), the Top 10, and the per-
+# album stats shown on the back of its covers.
 # --------------------------------------------------------------------------
 
 SCHEMA = """
@@ -373,6 +427,7 @@ CREATE TABLE IF NOT EXISTS settings (
 
 
 def connect(path):
+    """Open (or create) the library database, bring older libraries up to date and lock down its folders."""
     global DATA_DIR
     path = Path(path)
     private_files()
@@ -408,11 +463,13 @@ def connect(path):
 
 
 def get_setting(con, key, default=None):
+    """One saved preference from the settings table, or default if it isn't set."""
     row = con.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
     return row["value"] if row else default
 
 
 def set_setting(con, key, value):
+    """Save one preference to the settings table (adding or replacing it)."""
     con.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
     con.commit()
@@ -522,6 +579,7 @@ def fmt_plays(album, sides):
 
 
 def record_sides(con, record_id):
+    """A record's sides (label and running time), in order."""
     return con.execute(
         "SELECT * FROM sides WHERE record_id = ? ORDER BY rowid", (record_id,)
     ).fetchall()
@@ -529,6 +587,7 @@ def record_sides(con, record_id):
 
 def save_record(con, mbid, artist, title, year, fmt, sides, rgid=None, discogs_id=None, cover_url=None,
                 tracks=None, about=None):
+    """Add a record to the library with its sides, and its track listing and summary when known. Returns its id."""
     cur = con.execute(
         "INSERT INTO records (mbid, artist, title, year, format, added_at, rgid, discogs_id, cover_url) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -551,9 +610,16 @@ def save_record(con, mbid, artist, title, year, fmt, sides, rgid=None, discogs_i
 
 # --------------------------------------------------------------------------
 # MusicBrainz
+#
+# Finding albums and pressings, and turning a release's track list into sides with running times.
+#
+# Searches are album first: find the album (a "release group"), then pick the pressing (a "release")
+# you own, since pressings can differ. MusicBrainz asks clients to make at most one request a second
+# and to say who they are (set STYLI_CONTACT); every request goes through mb_get, which does both.
 # --------------------------------------------------------------------------
 
 class MBError(Exception):
+    """A lookup failed: offline, refused, or the site didn't have what was asked for. The message says which."""
     pass
 
 
@@ -564,12 +630,14 @@ LETTER_RE = re.compile(r"^\s*([A-Za-z]+)")
 
 
 def mb_get(path, params):
+    """Ask the MusicBrainz web service for something (one request at a time, across all threads)."""
     with _mb_lock:
         return _mb_get(path, params)
 
 
 def _mb_get(path, params):
     # MusicBrainz allows roughly one request per second per client.
+    """Do one MusicBrainz request, keeping to its one-request-a-second limit and retrying when it's busy."""
     wait = 1.1 - (time.monotonic() - _last_call[0])
     if wait > 0:
         time.sleep(wait)
@@ -595,6 +663,7 @@ def _mb_get(path, params):
 
 
 def lucene_phrase(s):
+    """Quote text so MusicBrainz's search treats it as one exact phrase."""
     return '"{}"'.format(s.replace("\\", "\\\\").replace('"', '\\"'))
 
 
@@ -618,6 +687,7 @@ def search_releases(free=None, artist=None, title=None, barcode=None, vinyl=True
 
 
 def fetch_release(mbid):
+    """One release (pressing) with its tracks, artists, labels and album id."""
     return mb_get("release/{}".format(mbid), {"inc": "recordings+artist-credits+labels+release-groups"})
 
 
@@ -633,10 +703,12 @@ def norm_tokens(text):
 
 
 def key_tokens(text):
+    """The meaningful words of some text ('the', 'a', 'an' and 'and' left out), for comparing names."""
     return {w for w in norm_tokens(text) if w not in SEARCH_STOPWORDS}
 
 
 def album_artist(g):
+    """The credited artist of a MusicBrainz album as one line, e.g. 'Simon & Garfunkel'."""
     return artist_credit_str(g.get("artist-credit"))
 
 
@@ -675,6 +747,8 @@ def search_albums(artist=None, title=None, free=None):
 
 
 def rank_albums(groups, artist=None, title=None, free=None):
+    """Keep albums really credited to the artist asked for, best match first: exact title, studio albums before
+    compilations and live albums, then the earliest."""
     seen, candidates = set(), []
     structured = bool(norm_tokens(artist) or norm_tokens(title))
     qa, qt, q = key_tokens(artist), key_tokens(title), key_tokens(free)
@@ -714,6 +788,7 @@ def rank_albums(groups, artist=None, title=None, free=None):
 
 
 def describe_album(g):
+    """One line describing an album for the command line: artist, title, year and type."""
     types = [g.get("primary-type") or "Other"] + list(g.get("secondary-types") or [])
     year = (g.get("first-release-date") or "")[:4]
     text = "{} - {}{}  [{}]".format(album_artist(g), g.get("title", "?"),
@@ -759,15 +834,18 @@ def list_pressings(rgid, cap=PRESSING_CAP):
 
 
 def is_vinyl(r):
+    """True if any disc of a release is vinyl."""
     return any("vinyl" in (m.get("format") or "").lower() for m in r.get("media") or [])
 
 
 def pressing_sort_key(r):
+    """Sort order for pressings: official ones first, then by date and country."""
     official = (r.get("status") or "Official") == "Official"
     return (0 if official else 1, r.get("date") or "9999", r.get("country") or "")
 
 
 def pressing_notes(r, album_title=None):
+    """Anything unusual about a pressing worth showing (bootleg, different title, MusicBrainz's note)."""
     notes = []
     if r.get("status") and r["status"] != "Official":
         notes.append(r["status"])
@@ -779,6 +857,7 @@ def pressing_notes(r, album_title=None):
 
 
 def describe_pressing(r, album_title=None):
+    """One line describing a pressing: date, country, format, label and barcode."""
     bits = [r.get("date") or "no date", r.get("country") or "", media_summary(r.get("media")),
             release_label(r), "barcode " + r["barcode"] if r.get("barcode") else "",
             pressing_notes(r, album_title)]
@@ -786,6 +865,7 @@ def describe_pressing(r, album_title=None):
 
 
 def artist_credit_str(credits):
+    """Join a MusicBrainz artist credit into one line, e.g. 'David Bowie & Queen'."""
     out = ""
     for c in credits or []:
         name = c.get("name") or (c.get("artist") or {}).get("name", "")
@@ -794,6 +874,7 @@ def artist_credit_str(credits):
 
 
 def media_summary(media):
+    """The discs of a release in short, e.g. '2x12" Vinyl'."""
     counts = {}
     for m in media or []:
         f = m.get("format") or "Unknown format"
@@ -802,6 +883,7 @@ def media_summary(media):
 
 
 def describe_release(r):
+    """Two lines describing a release for the command line (title line, then format and label)."""
     bits = [artist_credit_str(r.get("artist-credit")), "-", r.get("title", "?")]
     meta = [x for x in ((r.get("date") or "")[:4], r.get("country")) if x]
     if meta:
@@ -827,11 +909,13 @@ def describe_release(r):
 
 
 def track_seconds(t):
+    """A track's length in seconds, from the track or its recording, or None if unknown."""
     ms = t.get("length") or (t.get("recording") or {}).get("length")
     return int(round(ms / 1000)) if ms else None
 
 
 def side_letter(i):
+    """The letter for the nth side: 0 is A, 1 is B, and so on."""
     return chr(65 + i) if i < 26 else "S{}".format(i + 1)
 
 
@@ -848,6 +932,7 @@ def best_split(lengths):
 
 
 def ask_split(medium, mi, n_media, tracks, lengths, suggested):
+    """At the terminal, ask where side two starts on a disc listed without side letters."""
     label = medium.get("format") or "disc"
     which = " {} of {}".format(mi, n_media) if n_media > 1 else ""
     print("\nMusicBrainz lists {}{} without side letters (A1, B1...). Tracks:".format(label, which))
@@ -867,6 +952,8 @@ def ask_split(medium, mi, n_media, tracks, lengths, suggested):
 
 
 def build_sides(release, allow_prompt=True):
+    """Split a release's tracks into sides with running times. Uses the A1/B1 positions when they're there,
+    otherwise splits each disc in two at the most even point."""
     media = [m for m in release.get("media") or [] if m.get("tracks")]
     sides, used, next_idx = [], set(), 0
     for mi, m in enumerate(media, 1):
@@ -906,6 +993,7 @@ def build_sides(release, allow_prompt=True):
 
 
 def review_missing(sides):
+    """Warn about sides with tracks of unknown length, and at a terminal let you type the real length."""
     for s in sides:
         if not s["missing"]:
             continue
@@ -929,6 +1017,13 @@ def review_missing(sides):
 
 # --------------------------------------------------------------------------
 # Album art (Cover Art Archive, https://coverartarchive.org)
+#
+# Covers come from the Cover Art Archive (MusicBrainz) or Discogs. Each library record's cover is
+# saved beside the database (covers/record-N.img), so it works offline for good; covers seen while
+# searching go in a cache that can be cleared.
+#
+# Records entered by hand are matched to a MusicBrainz album by artist and title. A cover (or match)
+# that isn't available is remembered for a week, so it isn't asked for again and again.
 # --------------------------------------------------------------------------
 
 CAA_ROOT = "https://coverartarchive.org"
@@ -936,6 +1031,7 @@ MISS_RETRY_DAYS = 7
 
 
 def cache_dir():
+    """Where downloaded cover previews are kept (can be cleared at any time)."""
     return cache_base() / "styli" / "covers"
 
 
@@ -952,6 +1048,7 @@ custom_cover_path = library_cover_path  # older name
 
 
 def remove_record_cover(record_id):
+    """Delete a record's saved cover (when the record is removed or replaced)."""
     try:
         library_cover_path(record_id).unlink()
     except OSError:
@@ -987,12 +1084,37 @@ def ensure_record_cover(record_id, mbid, rgid, size=500, cover_url=None, artist=
     return dest, found
 
 
+def match_album_cached(artist, title):
+    """match_album, remembering for a week when nothing matched (so it isn't searched every time)."""
+    d = cache_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    tag = hashlib.sha1("{}\n{}".format(artist.lower(), title.lower()).encode("utf-8")).hexdigest()[:16]
+    miss = d / "match-{}.none".format(tag)
+    if miss.exists() and time.time() - miss.stat().st_mtime < MISS_RETRY_DAYS * 86400:
+        return None
+    found = match_album(artist, title)
+    if not found:
+        miss.touch()
+    return found
+
+
+def match_album(artist, title):
+    """The MusicBrainz album ID for an artist and album title, if one matches the title exactly."""
+    want = key_tokens(title)
+    for g in search_albums(artist=artist, title=title)[:10]:
+        if key_tokens(g.get("title")) == want:
+            return g.get("id")
+    return None
+
+
 def search_cache_size():
+    """Bytes used by the cover preview cache, for Preferences."""
     d = cache_dir()
     return sum(f.stat().st_size for f in d.glob("*") if f.is_file()) if d.exists() else 0
 
 
 def clear_search_cache():
+    """Empty the cover preview cache. Covers saved with your library are kept."""
     d = cache_dir()
     for f in d.glob("*") if d.exists() else []:
         try:
@@ -1040,10 +1162,14 @@ def lookup_rgid(mbid):
 
 
 # --------------------------------------------------------------------------
-# Lookups
+# Finding records, and cartridge / stylus wear
+#
+# Turning what you type (a number, or a few words of the artist and title) into a library record,
+# which cartridge / stylus is on the turntable, and how worn each one is.
 # --------------------------------------------------------------------------
 
 def resolve_record(con, ref):
+    """Find a library record from a number or words in its artist and title, asking when several match."""
     ref = ref.strip()
     if ref.isdigit():
         row = con.execute("SELECT * FROM records WHERE id = ?", (int(ref),)).fetchone()
@@ -1082,16 +1208,19 @@ def active_stylus(con):
 
 
 def stylus_used_seconds(con, s):
+    """A cartridge / stylus's total playing time: hours it had before plus every play logged with it."""
     row = con.execute("SELECT COALESCE(SUM(seconds), 0) FROM plays WHERE stylus_id = ?", (s["id"],)).fetchone()
     return s["initial_seconds"] + row[0]
 
 
 def stylus_bar(pct, width=30):
+    """A text progress bar for the command line, e.g. [######----]."""
     filled = min(width, int(round(width * pct / 100)))
     return "[" + "#" * filled + "-" * (width - filled) + "]"
 
 
 def stylus_alert(con, s):
+    """A line about a cartridge / stylus's wear, with a warning past its warning level or rated life."""
     used = stylus_used_seconds(con, s)
     rated = s["rated_hours"] * 3600
     pct = 100 * used / rated if rated else 0
@@ -1105,9 +1234,16 @@ def stylus_alert(con, s):
 
 # --------------------------------------------------------------------------
 # Core actions (shared by the command line and the window)
+#
+# Logging and removing plays, the play log, adding, editing and retiring cartridges / styli, and
+# exporting to CSV.
+#
+# Each play is stored as one row per side. Sides logged together share a log id, so the play log
+# shows them as one entry and Undo removes them together.
 # --------------------------------------------------------------------------
 
 def release_label(r):
+    """The label and catalogue number of a release, e.g. 'Warner Bros. BSK 3010'."""
     for li in r.get("label-info") or []:
         text = "{} {}".format((li.get("label") or {}).get("name", ""), li.get("catalog-number") or "").strip()
         if text:
@@ -1116,6 +1252,7 @@ def release_label(r):
 
 
 def release_has_side_letters(release):
+    """True if every track position starts with a side letter (A1, B2...)."""
     for m in release.get("media") or []:
         for t in m.get("tracks") or []:
             if not LETTER_RE.match(str(t.get("number") or "")):
@@ -1124,6 +1261,8 @@ def release_has_side_letters(release):
 
 
 def stylus_summary(con, s):
+    """Wear figures for a cartridge / stylus: hours used and left, percentage, recent rate per week, an estimated
+    date it reaches its rated life, and a level (ok, warn or over)."""
     used = stylus_used_seconds(con, s)
     rated = s["rated_hours"] * 3600
     pct = 100 * used / rated if rated else 0
@@ -1144,12 +1283,15 @@ def stylus_summary(con, s):
 
 
 def play_entries(sides, chosen, custom=None):
+    """(side, seconds) pairs for a play. A stopped-early play becomes one entry with the time given."""
     if custom is not None:
         return [("+".join(chosen) + " (partial)", custom)]
     return [(c, sides[c]["seconds"]) for c in chosen]
 
 
 def log_play(con, rec, entries, when, times=1, stylus=None):
+    """Record a play: one row per side (repeated for 'played it x times'), sharing one log id so they can be shown
+    and undone together. Returns (cartridge used, total seconds)."""
     stylus = stylus or active_stylus(con)
     label = "{} - {}".format(rec["artist"], rec["title"])
     times = max(1, int(times))
@@ -1237,11 +1379,13 @@ def describe_logged_sides(sides):
 
 
 def remove_plays(con, ids):
+    """Delete plays by id. Their time comes off the cartridge / stylus they were logged with."""
     con.executemany("DELETE FROM plays WHERE id = ?", [(i,) for i in ids])
     con.commit()
 
 
 def replace_sides(con, record_id, sides):
+    """Replace all of a record's sides with a new set (after editing them)."""
     con.execute("DELETE FROM sides WHERE record_id = ?", (record_id,))
     for s in sides:
         con.execute(
@@ -1280,6 +1424,7 @@ def stylus_retire(con, sid, when=None):
 
 
 def stylus_edit(con, sid, name=None, hours=None, warn=None, used_h=None, installed=None):
+    """Change a cartridge / stylus's details; anything not given stays as it was."""
     row = con.execute("SELECT * FROM styli WHERE id = ?", (sid,)).fetchone()
     if not row:
         return False
@@ -1297,6 +1442,7 @@ def stylus_edit(con, sid, name=None, hours=None, warn=None, used_h=None, install
 
 
 def write_csv(con, fh):
+    """Write every play to a CSV file (when, record, side, minutes, cartridge). Returns how many."""
     rows = con.execute(
         "SELECT p.played_at, p.record_label, p.side, p.seconds, s.name stylus "
         "FROM plays p LEFT JOIN styli s ON s.id = p.stylus_id ORDER BY p.played_at").fetchall()
@@ -1308,7 +1454,10 @@ def write_csv(con, fh):
 
 
 # --------------------------------------------------------------------------
-# Styli: several can be in use at once; one is "on the turntable"
+# Cartridges / styli: several can be in use at once; one is "on the turntable"
+#
+# Plays are logged against the one on the turntable unless another is chosen. Retired ones keep
+# their plays and hours for the record.
 # --------------------------------------------------------------------------
 
 def styli_in_use(con):
@@ -1317,6 +1466,7 @@ def styli_in_use(con):
 
 
 def set_current_stylus(con, sid):
+    """Remember which cartridge / stylus is on the turntable."""
     set_setting(con, "current_stylus", str(sid) if sid else "")
 
 
@@ -1333,6 +1483,7 @@ def stylus_stats(con, s):
 
 
 def stylus_hours_by_month(con, sid):
+    """(YYYY-MM, seconds) for each month a cartridge / stylus was played."""
     rows = con.execute("SELECT substr(played_at, 1, 7) m, SUM(seconds) FROM plays WHERE stylus_id = ? "
                        "GROUP BY m ORDER BY m", (sid,)).fetchall()
     return [(r[0], r[1]) for r in rows]
@@ -1340,6 +1491,10 @@ def stylus_hours_by_month(con, sid):
 
 # --------------------------------------------------------------------------
 # Lifetime charts and the weekly heatmap
+#
+# The numbers behind the Stats tab and `styli stats`: running totals over a cartridge / stylus's
+# life, totals per day, week or month (empty ones included, so quiet spells show), the longest
+# break, and when in the week you play.
 # --------------------------------------------------------------------------
 
 CHART_UNITS = ("day", "week", "month")
@@ -1362,6 +1517,7 @@ def period_start(day, unit):
 
 
 def next_period(day, unit):
+    """The first day of the following day, week or month."""
     if unit == "week":
         return day + dt.timedelta(days=7)
     if unit == "month":
@@ -1370,6 +1526,7 @@ def next_period(day, unit):
 
 
 def auto_unit(first, last):
+    """Bars by day for a couple of months, by week up to two years, and by month after that."""
     span = (last - first).days
     return "day" if span <= 62 else ("week" if span <= 730 else "month")
 
@@ -1492,6 +1649,10 @@ def stylus_delete(con, sid):
 
 # --------------------------------------------------------------------------
 # Cartridge photo and specifications
+#
+# Photos and specifications from Wikipedia, or from a manufacturer's or shop's product page. Product
+# pages are read for their meta tags, structured data (JSON-LD) and "Label: value" lines, and
+# specifications are recognised by the patterns in SPEC_FIELDS.
 # --------------------------------------------------------------------------
 
 SPEC_FIELDS = [
@@ -1509,10 +1670,12 @@ SPEC_FIELDS = [
 
 
 def stylus_photo_path(sid):
+    """Where a cartridge / stylus's photo is saved, beside the library."""
     return (DATA_DIR or default_db_path().parent) / "cartridges" / "stylus-{}.img".format(sid)
 
 
 def save_stylus_photo(sid, data):
+    """Save a cartridge / stylus photo (replacing any earlier one safely)."""
     path = stylus_photo_path(sid)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -1522,6 +1685,7 @@ def save_stylus_photo(sid, data):
 
 
 def get_specs(s):
+    """A cartridge / stylus's saved specifications as a dictionary."""
     try:
         return json.loads(s["specs"] or "{}")
     except (ValueError, TypeError, IndexError, KeyError):
@@ -1529,6 +1693,8 @@ def get_specs(s):
 
 
 def set_stylus_details(con, sid, specs=None, url=None):
+    """Merge new specifications (and a product link) into a cartridge / stylus's saved ones. An empty value removes
+    that specification."""
     row = con.execute("SELECT * FROM styli WHERE id = ?", (sid,)).fetchone()
     merged = get_specs(row)
     for k, v in (specs or {}).items():
@@ -1604,6 +1770,7 @@ class _PageReader(html.parser.HTMLParser):
         self._buf = []
 
     def handle_starttag(self, tag, attrs):
+        """Note meta tags and structured data, and start a new line at each block, row or cell."""
         a = dict(attrs)
         if tag == "meta":
             key = (a.get("property") or a.get("name") or "").lower()
@@ -1626,6 +1793,7 @@ class _PageReader(html.parser.HTMLParser):
             self._flush()
 
     def handle_endtag(self, tag):
+        """Finish table rows and definition lists as 'Label: value' lines."""
         if tag == "script" and self._ld is not None:
             self.jsonld.append("".join(self._ld))
             self._ld = None
@@ -1656,6 +1824,7 @@ class _PageReader(html.parser.HTMLParser):
             self._flush()
 
     def handle_data(self, data):
+        """Collect the visible text (scripts and styles are skipped)."""
         if self._ld is not None:
             self._ld.append(data)
             return
@@ -1670,6 +1839,7 @@ class _PageReader(html.parser.HTMLParser):
 
 
 def _walk_jsonld(obj):
+    """Every object in a page's structured data (JSON-LD), including nested ones."""
     if isinstance(obj, list):
         for o in obj:
             yield from _walk_jsonld(o)
@@ -1681,6 +1851,7 @@ def _walk_jsonld(obj):
 
 
 def extract_specs(lines):
+    """Pick cartridge specifications out of 'Label: value' lines, using the patterns in SPEC_FIELDS."""
     specs = {}
     for line in lines:
         m = re.match(r"^\s*([^:]{2,45}?)\s*[:：]\s*(.{1,120})$", line)
@@ -1746,6 +1917,13 @@ def scrape_product_page(url):
 
 # --------------------------------------------------------------------------
 # Discogs (https://www.discogs.com/developers): your collection as a source
+#
+# Linking your account with a personal access token, reading your collection and turning a Discogs
+# release into sides. Discogs allows 60 requests a minute, so discogs_get keeps to about one a
+# second, and the collection is saved locally and refreshed when it's 12 hours old.
+#
+# Discogs track lists often lack lengths, so missing ones are filled in from the MusicBrainz release
+# linked to it, or one with the same barcode.
 # --------------------------------------------------------------------------
 
 DISCOGS_API = "https://api.discogs.com"
@@ -1756,10 +1934,12 @@ _dg_lock = threading.Lock()  # Discogs allows 60 requests a minute with a token
 
 
 class DiscogsError(MBError):
+    """A Discogs request failed. Its message says why."""
     pass
 
 
 def discogs_get(path, token, params=None):
+    """Ask the Discogs API for something with your access token, keeping to its rate limit."""
     with _dg_lock:
         wait = 1.05 - (time.monotonic() - _dg_last[0])
         if wait > 0:
@@ -1790,6 +1970,7 @@ def discogs_get(path, token, params=None):
 
 
 def discogs_identity(token):
+    """The Discogs username a personal access token belongs to (also checks the token works)."""
     return discogs_get("/oauth/identity", token)["username"]
 
 
@@ -1827,6 +2008,7 @@ def discogs_link(con, token):
 
 
 def discogs_unlink(con):
+    """Forget the linked Discogs account and remove its token from the keyring and database."""
     delete_secret(con, "discogs_token")
     con.execute("DELETE FROM settings WHERE key = 'discogs_user'")
     con.commit()
@@ -1852,6 +2034,7 @@ def discogs_collection_page(token, user, page=1):
 
 
 def _discogs_cache_path(user):
+    """Where the local copy of someone's Discogs collection is saved."""
     return cache_dir().parent / "discogs-{}.json".format(re.sub(r"\W", "_", user))
 
 
@@ -1866,6 +2049,7 @@ def load_discogs_cache(user):
 
 
 def save_discogs_cache(user, items):
+    """Save a downloaded Discogs collection so it opens instantly next time."""
     path = _discogs_cache_path(user)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"fetched": time.time(), "items": items}), encoding="utf-8")
@@ -1888,10 +2072,12 @@ def discogs_collection(token, user, refresh=False, progress=None):
 
 
 def _clean_artist(name):
+    """An artist name without the (2), (3) Discogs adds to tell namesakes apart."""
     return re.sub(r"\s\(\d+\)$", "", name or "")  # Discogs adds (2), (3) to tell namesakes apart
 
 
 def discogs_artists(artists):
+    """Join Discogs artist credits into one line, as printed on the sleeve."""
     artists = artists or []
     out = ""
     for i, a in enumerate(artists):
@@ -1903,6 +2089,7 @@ def discogs_artists(artists):
 
 
 def discogs_formats(formats):
+    """Describe Discogs formats in short, e.g. '2xVinyl, LP, Album'."""
     parts = []
     for f in formats or []:
         qty = str(f.get("qty") or "1")
@@ -1925,12 +2112,14 @@ def discogs_item_info(item):
 
 
 def describe_discogs_item(item):
+    """One line describing a collection item for the command line."""
     i = discogs_item_info(item)
     return "{} - {}{}  [{}]{}".format(i["artist"], i["title"], " ({})".format(i["year"]) if i["year"] else "",
                                        i["format"], "  " + i["label"] if i["label"] else "")
 
 
 def _duration_ms(text):
+    """A Discogs track duration ('4:31') in milliseconds, or None."""
     text = (text or "").strip()
     if not text:
         return None
@@ -1977,6 +2166,7 @@ def mb_release_for_discogs(discogs_id):
 
 
 def discogs_barcode(rel):
+    """A release's barcode from its Discogs identifiers, if it has a usable one."""
     for ident in rel.get("identifiers") or []:
         if (ident.get("type") or "").lower() == "barcode":
             digits = re.sub(r"\D", "", ident.get("value") or "")
@@ -2063,6 +2253,12 @@ def fetch_image_cached(url):
 
 # --------------------------------------------------------------------------
 # Album details: track listing and a short summary
+#
+# What's shown under "About this album". Track listings come from MusicBrainz or Discogs; summaries
+# from Discogs or MusicBrainz, plus Wikipedia's article on the album when it has one.
+#
+# fetch_details runs in the background and never touches the database; store_details saves what it
+# found. When nothing is found it tries again after ABOUT_RETRY_DAYS.
 # --------------------------------------------------------------------------
 
 ABOUT_RETRY_DAYS = 30  # look again after this long if nothing was found
@@ -2079,10 +2275,12 @@ def tracks_from_sides(sides):
 
 
 def get_tracks(con, record_id):
+    """A record's saved track listing, in order."""
     return con.execute("SELECT * FROM tracks WHERE record_id = ? ORDER BY n", (record_id,)).fetchall()
 
 
 def save_tracks(con, record_id, tracks):
+    """Replace a record's saved track listing."""
     con.execute("DELETE FROM tracks WHERE record_id = ?", (record_id,))
     for n, t in enumerate(tracks or []):
         con.execute("INSERT INTO tracks (record_id, n, position, side, title, seconds) VALUES (?, ?, ?, ?, ?, ?)",
@@ -2092,6 +2290,7 @@ def save_tracks(con, record_id, tracks):
 
 
 def get_about(rec):
+    """A record's saved summary (genres, release details, Wikipedia extract), or None."""
     try:
         return json.loads(rec["about"]) if rec["about"] else None
     except (ValueError, TypeError, IndexError, KeyError):
@@ -2099,6 +2298,7 @@ def get_about(rec):
 
 
 def set_about(con, record_id, about):
+    """Save a record's summary."""
     con.execute("UPDATE records SET about = ? WHERE id = ?", (json.dumps(about), record_id))
     con.commit()
 
@@ -2123,6 +2323,8 @@ def clean_discogs_text(text):
 
 
 def about_from_discogs(rel):
+    """Summary details from a Discogs release: genres and styles, release date, label, country and the pressing
+    notes."""
     labels = rel.get("labels") or []
     lab = "{} {}".format(labels[0].get("name", ""), labels[0].get("catno", "")).strip() if labels else ""
     notes = clean_discogs_text(rel.get("notes"))
@@ -2135,6 +2337,8 @@ def about_from_discogs(rel):
 
 
 def about_from_musicbrainz(mbrel, rgid=None):
+    """Summary details from MusicBrainz: release date, country, label, and the album's genres and first release
+    date."""
     out = {"released": mbrel.get("date") or "", "country": mbrel.get("country") or "",
            "label": release_label(mbrel)}
     rgid = rgid or (mbrel.get("release-group") or {}).get("id")
@@ -2228,9 +2432,15 @@ def store_details(con, record_id, result):
 
 # --------------------------------------------------------------------------
 # Commands
+#
+# One function per `styli` sub-command (cmd_<name>, listed in COMMANDS below). Each gets the open
+# database and the parsed options, prints its result and returns an exit code (0 for success).
 # --------------------------------------------------------------------------
 
+# ---- adding records: MusicBrainz, Discogs or by hand -------------------------------------------------
+
 def cmd_add(con, args):
+    """styli add: find an album on MusicBrainz (or Discogs, or enter it by hand), pick your pressing and save it."""
     if args.manual:
         return add_manual(con, args)
     if args.discogs or args.discogs_id:
@@ -2313,6 +2523,7 @@ def choose(items, describe, heading):
 
 
 def add_from_discogs(con, args):
+    """styli add --discogs: pick a record from your Discogs collection and save it."""
     token, user = discogs_account(con)
     if not token:
         err("link your Discogs account first: styli discogs link <token>\n"
@@ -2366,6 +2577,8 @@ def add_from_discogs(con, args):
 
 
 def pick_release(args):
+    """Walk through choosing a pressing at the terminal: barcode, or album then pressing. Returns its MusicBrainz
+    id."""
     if args.barcode:
         results, _ = search_releases(barcode=args.barcode, vinyl=False, limit=25)
         if not results:
@@ -2413,6 +2626,7 @@ def pick_release(args):
 
 
 def add_manual(con, args):
+    """styli add --manual: save a record with side lengths you type in."""
     artist = args.artist or (ask("Artist: ") if interactive() else "")
     title = args.title or (ask("Album title: ") if interactive() else "")
     if not artist or not title:
@@ -2445,7 +2659,10 @@ def add_manual(con, args):
     return 0
 
 
+# ---- logging plays -----------------------------------------------------------------------------------
+
 def cmd_play(con, args):
+    """styli play: log sides of a record as played (now, or at the time given)."""
     rec = resolve_record(con, args.record)
     if not rec:
         return 1
@@ -2487,7 +2704,10 @@ def cmd_play(con, args):
     return 0
 
 
+# ---- reports: status, the library, Top 10, stats, history and the play log ---------------------------
+
 def cmd_status(con, args):
+    """styli status: wear on each cartridge / stylus in use, and a listening summary."""
     in_use = styli_in_use(con)
     cur = active_stylus(con)
     if not in_use:
@@ -2527,6 +2747,7 @@ def cmd_status(con, args):
 
 
 def cmd_list(con, args):
+    """styli list: the records in your library with their sides and play counts."""
     rows = con.execute("SELECT * FROM records ORDER BY artist, title").fetchall()
     if args.filter:
         words = " ".join(args.filter).lower().split()
@@ -2549,6 +2770,7 @@ def cmd_list(con, args):
 
 
 def cmd_top(con, args):
+    """styli top: your most played albums, all time or over a recent period."""
     since = period_since(args.period)
     top = top_albums(con, args.n, since)
     name = {k: n for k, n, _ in TOP_PERIODS}[args.period]
@@ -2564,6 +2786,7 @@ def cmd_top(con, args):
 
 
 def cmd_stats(con, args):
+    """styli stats: a cartridge / stylus's plays over its life and when in the week you play, as text charts."""
     s = find_stylus(con, " ".join(args.stylus)) if args.stylus else active_stylus(con)
     if not s:
         err("no cartridge / stylus found." if args.stylus else "no cartridge / stylus is on the turntable.")
@@ -2602,6 +2825,7 @@ def cmd_stats(con, args):
 
 
 def cmd_history(con, args):
+    """styli history: recent plays, one line per side."""
     where, params = "", []
     if args.stylus:
         s = find_stylus(con, args.stylus)
@@ -2630,6 +2854,7 @@ def _latest_logged(con, n):
 
 
 def cmd_log(con, args):
+    """styli log: the play log, one line each time you logged a play."""
     log = play_log(con, limit=args.n)
     if not log:
         print("No plays logged yet.")
@@ -2643,6 +2868,7 @@ def cmd_log(con, args):
 
 
 def cmd_undo(con, args):
+    """styli undo: remove the last play logged, or a numbered one from styli log."""
     if args.number:
         log = play_log(con, limit=args.number)
         if len(log) < args.number:
@@ -2666,7 +2892,10 @@ def cmd_undo(con, args):
     return 0
 
 
+# ---- correcting the library, and exporting -----------------------------------------------------------
+
 def cmd_side(con, args):
+    """styli side: correct or remove one side's running time."""
     rec = resolve_record(con, args.record)
     if not rec:
         return 1
@@ -2695,6 +2924,7 @@ def cmd_side(con, args):
 
 
 def cmd_remove(con, args):
+    """styli remove: take a record out of the library (its plays are kept)."""
     rec = resolve_record(con, args.record)
     if not rec:
         return 1
@@ -2708,6 +2938,7 @@ def cmd_remove(con, args):
 
 
 def cmd_export(con, args):
+    """styli export: write every play to a CSV file."""
     if args.file == "-":
         write_csv(con, sys.stdout)
         return 0
@@ -2717,7 +2948,10 @@ def cmd_export(con, args):
     return 0
 
 
+# ---- cartridges / styli ------------------------------------------------------------------------------
+
 def cmd_stylus(con, args):
+    """styli stylus (or cartridge): list, add, put on, retire, edit, show, look up or delete cartridges / styli."""
     act = args.stylus_cmd or "list"
     if act == "add":
         try:
@@ -2780,6 +3014,7 @@ def cmd_stylus(con, args):
 
 
 def show_stylus(con, s):
+    """styli stylus show: everything about one cartridge / stylus, with its hours by month."""
     m = stylus_stats(con, s)
     print("#{}  {}".format(s["id"], s["name"]))
     print("  {:<19} {}".format("Status", "in use" if m["in_use"] else "retired {}".format(
@@ -2806,6 +3041,7 @@ def show_stylus(con, s):
 
 
 def lookup_stylus(con, s, url=None):
+    """styli stylus lookup: fetch a photo and specifications from Wikipedia or a product page."""
     try:
         found = scrape_product_page(url) if url else lookup_wikipedia(s["name"])
     except MBError as e:
@@ -2840,30 +3076,10 @@ def lookup_stylus(con, s, url=None):
     return 0
 
 
-def match_album_cached(artist, title):
-    """match_album, remembering for a week when nothing matched (so it isn't searched every time)."""
-    d = cache_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    tag = hashlib.sha1("{}\n{}".format(artist.lower(), title.lower()).encode("utf-8")).hexdigest()[:16]
-    miss = d / "match-{}.none".format(tag)
-    if miss.exists() and time.time() - miss.stat().st_mtime < MISS_RETRY_DAYS * 86400:
-        return None
-    found = match_album(artist, title)
-    if not found:
-        miss.touch()
-    return found
-
-
-def match_album(artist, title):
-    """The MusicBrainz album ID for an artist and album title, if one matches the title exactly."""
-    want = key_tokens(title)
-    for g in search_albums(artist=artist, title=title)[:10]:
-        if key_tokens(g.get("title")) == want:
-            return g.get("id")
-    return None
-
+# ---- covers, Discogs, album details and the menu entry -----------------------------------------------
 
 def cmd_covers(con, args):
+    """styli covers: save covers for records that don't have one, matching hand-entered albums by name."""
     rows = [r for r in con.execute("SELECT * FROM records ORDER BY artist COLLATE NOCASE, title COLLATE NOCASE")
             if not library_cover_path(r["id"]).exists()]
     print("Styli {}: looking for covers for {} record{} (MusicBrainz allows about one search a second).".format(
@@ -2900,6 +3116,7 @@ def cmd_covers(con, args):
 
 
 def cmd_discogs(con, args):
+    """styli discogs: link, unlink or check your Discogs account, or list your collection."""
     act = args.discogs_cmd or "status"
     if act == "link":
         try:
@@ -2948,6 +3165,7 @@ def cmd_discogs(con, args):
 
 
 def cmd_info(con, args):
+    """styli info: a record's summary and track listing."""
     rec = resolve_record(con, args.record)
     if not rec:
         return 1
@@ -3051,6 +3269,7 @@ def install_icon():
 
 
 def cmd_desktop(con, args):
+    """styli desktop-entry: add Styli, with its icon, to the Linux applications menu."""
     if not sys.platform.startswith("linux"):
         err("desktop menu entries are a Linux feature.")
         return 1
@@ -3076,9 +3295,14 @@ def cmd_desktop(con, args):
 
 # --------------------------------------------------------------------------
 # Command-line interface
+#
+# The options and sub-commands (what `styli --help` shows), and main(), which runs one command.
+# Running styli with no command opens the window when started from a menu, or shows the status in a
+# terminal.
 # --------------------------------------------------------------------------
 
 def build_parser():
+    """The command-line options and sub-commands (what styli --help shows)."""
     p = argparse.ArgumentParser(
         prog="styli",
         description="Log vinyl plays by side and track cartridge / stylus wear. Running times come from MusicBrainz.",
@@ -3212,6 +3436,7 @@ COMMANDS = {
 
 
 def main(argv=None):
+    """Run one command: open the library, do what was asked and close it again. Returns the exit code."""
     global ASSUME_YES
     args = build_parser().parse_args(argv)
     if args.db == str(default_db_path()):

@@ -4,14 +4,18 @@
 #   - creates the `styli` command (and `vt` as a short name) in ~/.local/bin
 #   - adds Styli to your applications menu
 #   - moves a library from the app's earlier name (vinyltrack) across, if there is one
+#   - checks for PyQt6 (needed for the window) and keyring (optional, keeps a Discogs token safe)
 # Run it from the folder containing those three files:  sh install.sh
-set -e
+# Running it again updates Styli in place; your library and settings are never touched.
+set -e  # stop at the first thing that fails
 
+# Where things go: the program in Styli's own folder, the commands in ~/.local/bin.
 here="$(cd "$(dirname "$0")" && pwd)"
 data="${XDG_DATA_HOME:-$HOME/.local/share}"
 dest="$data/styli/app"
 bin="$HOME/.local/bin"
 
+# Copy the program and icon, and make the `styli` and `vt` commands point at it.
 mkdir -p "$dest" "$bin"
 cp "$here/styli.py" "$here/styli_gui.py" "$dest/"
 if [ -f "$here/styli.png" ]; then
@@ -24,12 +28,14 @@ ln -sf "$dest/styli.py" "$bin/styli"
 ln -sf "$dest/styli.py" "$bin/vt"
 echo "Installed the styli command to $bin/styli (vt still works too)"
 
+# ~/.local/bin has to be on your PATH for the commands to work from a terminal.
 case ":$PATH:" in
   *":$bin:"*) ;;
   *) echo "Note: $bin is not on your PATH. Add this line to ~/.profile, then log out and back in:"
      echo "  export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
 esac
 
+# The window needs PyQt6. The commands work without it.
 if python3 -c "import PyQt6.QtWidgets" 2>/dev/null; then
   echo "PyQt6 found."
 else
@@ -39,6 +45,7 @@ else
   echo "  Arch/Manjaro:       sudo pacman -S python-pyqt6"
 fi
 
+# Optional: with keyring, a linked Discogs token goes in the system keyring rather than the database.
 if python3 -c "import keyring" 2>/dev/null; then
   echo "keyring found: a linked Discogs token is kept in your system keyring."
 else
