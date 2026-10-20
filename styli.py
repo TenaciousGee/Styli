@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.9.2"
+VERSION = "1.10.0"
 MB_ROOT = "https://musicbrainz.org/ws/2"
 # MusicBrainz asks every client to send a meaningful User-Agent with contact
 # details. Set STYLI_CONTACT to your email or a project URL.
@@ -76,6 +76,133 @@ def cache_base():
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Caches"
     return Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+
+
+# --------------------------------------------------------------------------
+# Privacy: folders only you can read, and secrets kept in the system keyring
+# --------------------------------------------------------------------------
+
+def private_files():
+    """New files and folders are readable by you only (Linux and Mac; Windows keeps each person's
+    AppData private already)."""
+    if os.name == "posix":
+        os.umask(0o077)
+
+
+def make_private(path):
+    """Limit an existing file or folder to your own user account (Linux and Mac)."""
+    if os.name != "posix":
+        return
+    try:
+        os.chmod(str(path), 0o700 if Path(path).is_dir() else 0o600)
+    except OSError:
+        pass
+
+
+def secure_folders(db_path):
+    """Lock down the database, the folders Styli keeps beside it, and Styli's cache."""
+    db_path = Path(db_path)
+    folder = db_path.parent
+    if folder == default_db_path().parent or folder.name.lower() == "styli":
+        make_private(folder)  # only a folder that's Styli's own, never e.g. Downloads
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        f = Path(str(db_path) + suffix)
+        if f.exists():
+            make_private(f)
+    for sub in (folder / "covers", folder / "cartridges", cache_base() / "styli"):
+        if sub.is_dir():
+            make_private(sub)
+            for root, dirs, files in os.walk(str(sub)):
+                for name in dirs + files:
+                    make_private(Path(root) / name)
+
+
+KEYRING_SERVICE = "Styli"
+
+
+def system_keyring():
+    """The keyring module when a real keyring is available (GNOME Keyring or KWallet on Linux,
+    Keychain on a Mac, Credential Manager on Windows), otherwise None."""
+    try:
+        import keyring
+        backend = keyring.get_keyring()
+    except Exception:
+        return None
+    if getattr(backend, "priority", 1) <= 0 or type(backend).__module__.endswith((".fail", ".null")):
+        return None
+    return keyring
+
+
+class SecretError(Exception):
+    pass
+
+
+def _secret_name(con, name):
+    """Each library has its own entry, so a copy of the database on another computer (or the demo
+    library) never picks up your token."""
+    lib = get_setting(con, "library_id")
+    if not lib:
+        lib = hashlib.sha1(os.urandom(16)).hexdigest()[:12]
+        set_setting(con, "library_id", lib)
+    return "{}-{}".format(name, lib)
+
+
+def secret_store(con, name):
+    """Where a secret is kept: "keyring", "file" or None (not saved)."""
+    return get_setting(con, name + "_store") or ("file" if get_setting(con, name) else None)
+
+
+def _forget_in_database(con, name):
+    con.execute("PRAGMA secure_delete = ON")  # overwrite it, rather than leave it in free space
+    con.execute("DELETE FROM settings WHERE key = ?", (name,))
+    con.commit()
+
+
+def set_secret(con, name, value):
+    """Save a secret in the system keyring, or in the database if there's no keyring.
+    Returns where it went: "keyring" or "file"."""
+    kr = system_keyring()
+    if kr:
+        try:
+            kr.set_password(KEYRING_SERVICE, _secret_name(con, name), value)
+            _forget_in_database(con, name)
+            set_setting(con, name + "_store", "keyring")
+            return "keyring"
+        except Exception:
+            pass  # a locked or refused keyring: fall back rather than lose the token
+    set_setting(con, name, value)
+    set_setting(con, name + "_store", "file")
+    return "file"
+
+
+def get_secret(con, name):
+    """A saved secret, moving it into the keyring if it was saved before one was available."""
+    store = secret_store(con, name)
+    if store == "keyring":
+        kr = system_keyring()
+        if not kr:
+            raise SecretError("the system keyring isn't available")
+        try:
+            return kr.get_password(KEYRING_SERVICE, _secret_name(con, name))
+        except Exception as e:
+            raise SecretError("the system keyring couldn't be read ({})".format(e))
+    value = get_setting(con, name)
+    if value and system_keyring():
+        set_secret(con, name, value)  # upgrade: out of the database and into the keyring
+    return value
+
+
+def delete_secret(con, name):
+    if secret_store(con, name) == "keyring":
+        kr = system_keyring()
+        if kr:
+            try:
+                kr.delete_password(KEYRING_SERVICE, _secret_name(con, name))
+            except Exception:
+                pass
+    _forget_in_database(con, name)
+    con.execute("DELETE FROM settings WHERE key = ?", (name + "_store",))
+    con.commit()
 
 
 def default_db_path():
@@ -248,6 +375,7 @@ CREATE TABLE IF NOT EXISTS settings (
 def connect(path):
     global DATA_DIR
     path = Path(path)
+    private_files()
     path.parent.mkdir(parents=True, exist_ok=True)
     DATA_DIR = path.parent
     old_photos = DATA_DIR / "styli"  # cartridge photos' folder before the rename
@@ -256,6 +384,8 @@ def connect(path):
     con = sqlite3.connect(str(path))
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
+    con.execute("PRAGMA secure_delete = ON")  # deleted data is overwritten, not left behind in the file
+    secure_folders(path)
     con.executescript(SCHEMA)
     cols = {r["name"] for r in con.execute("PRAGMA table_info(records)")}
     if "rgid" not in cols:  # album ID, added in v1.1 for album art
@@ -1663,23 +1793,54 @@ def discogs_identity(token):
     return discogs_get("/oauth/identity", token)["username"]
 
 
+DISCOGS_PROBLEM = None  # why the token couldn't be read, if it couldn't
+
+
 def discogs_account(con):
-    token, user = get_setting(con, "discogs_token"), get_setting(con, "discogs_user")
-    return (token, user) if token and user else (None, None)
+    """(token, username) for the linked Discogs account, or (None, None)."""
+    global DISCOGS_PROBLEM
+    user = get_setting(con, "discogs_user")
+    if not user:
+        return None, None
+    try:
+        token = get_secret(con, "discogs_token")
+        DISCOGS_PROBLEM = None
+    except SecretError as e:
+        DISCOGS_PROBLEM = "Couldn't read your Discogs token: {}. Unlock it, or link the account again.".format(e)
+        return None, None
+    return (token, user) if token else (None, None)
+
+
+def save_discogs_account(con, token, user):
+    """Remember a checked token. Returns "keyring" or "file" (where the token was saved)."""
+    where = set_secret(con, "discogs_token", token)
+    set_setting(con, "discogs_user", user)
+    return where
 
 
 def discogs_link(con, token):
     """Check a personal access token and remember it. Returns the Discogs username."""
     token = token.strip()
     user = discogs_identity(token)
-    set_setting(con, "discogs_token", token)
-    set_setting(con, "discogs_user", user)
+    save_discogs_account(con, token, user)
     return user
 
 
 def discogs_unlink(con):
-    con.execute("DELETE FROM settings WHERE key IN ('discogs_token', 'discogs_user')")
+    delete_secret(con, "discogs_token")
+    con.execute("DELETE FROM settings WHERE key = 'discogs_user'")
     con.commit()
+
+
+def token_storage_note(con):
+    """A sentence on where the Discogs token is kept, for the status line and Preferences."""
+    store = secret_store(con, "discogs_token")
+    if store == "keyring":
+        return "The access token is kept in your system keyring."
+    if store == "file":
+        return ("The access token is kept in Styli's database, readable only by your user account. "
+                "Install the Python keyring package to keep it in your system keyring instead.")
+    return ""
 
 
 def discogs_collection_page(token, user, page=1):
@@ -2747,6 +2908,7 @@ def cmd_discogs(con, args):
             err(str(e))
             return 1
         print("Linked to Discogs as {}. Add records from your collection with: styli add --discogs [words]".format(user))
+        print(token_storage_note(con))
         return 0
     if act == "unlink":
         discogs_unlink(con)
@@ -2754,6 +2916,9 @@ def cmd_discogs(con, args):
         return 0
     token, user = discogs_account(con)
     if not token:
+        if DISCOGS_PROBLEM:
+            err(DISCOGS_PROBLEM)
+            return 1
         print("Not linked. Create a personal access token at {}\nthen run: styli discogs link <token>".format(
             DISCOGS_TOKEN_PAGE))
         return 0 if act == "status" else 1
@@ -2761,6 +2926,7 @@ def cmd_discogs(con, args):
         items, age = load_discogs_cache(user)
         print("Linked to Discogs as {}.{}".format(user, " {} items in the local copy of your collection.".format(
             len(items)) if items is not None else ""))
+        print(token_storage_note(con))
         return 0
     try:
         items = discogs_collection(token, user, refresh=args.refresh,

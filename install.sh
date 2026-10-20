@@ -39,6 +39,15 @@ else
   echo "  Arch/Manjaro:       sudo pacman -S python-pyqt6"
 fi
 
+if python3 -c "import keyring" 2>/dev/null; then
+  echo "keyring found: a linked Discogs token is kept in your system keyring."
+else
+  echo "Optional: install keyring so a linked Discogs token is kept in your system keyring:"
+  echo "  Debian/Ubuntu/Mint: sudo apt install python3-keyring"
+  echo "  Fedora:             sudo dnf install python3-keyring"
+  echo "  Arch/Manjaro:       sudo pacman -S python-keyring"
+fi
+
 # Adds the menu entry and icon, and on first run moves an existing library into Styli's folder.
 python3 "$dest/styli.py" desktop-entry
 

@@ -4592,8 +4592,7 @@ class DiscogsLinkDialog(QDialog):
         def ok(user):
             if self.closed:
                 return
-            core.set_setting(self.main.con, "discogs_token", token)
-            core.set_setting(self.main.con, "discogs_user", user)
+            core.save_discogs_account(self.main.con, token, user)  # into the system keyring if there is one
             self.user = user
             self.main.update_discogs_tab()
             self.accept()
@@ -4743,10 +4742,17 @@ class PrefsDialog(QDialog):
 
     def _show_discogs(self):
         token, user = core.discogs_account(self.main.con)
-        self.dg_status.setText("Linked as {}. Your collection has its own Discogs tab.".format(user) if token else
-                               "Not linked. Link your account to pick records from your Discogs collection.")
-        self.dg_link_btn.setText("Use a different token" if token else "Link Discogs account")
-        self.dg_unlink_btn.setVisible(bool(token))
+        if token:
+            text = "Linked as {}. Your collection has its own Discogs tab. {}".format(
+                user, core.token_storage_note(self.main.con))
+        elif core.DISCOGS_PROBLEM:
+            text = core.DISCOGS_PROBLEM
+        else:
+            text = "Not linked. Link your account to pick records from your Discogs collection."
+        self.dg_status.setText(text)
+        self.dg_status.setWordWrap(True)
+        self.dg_link_btn.setText("Use a different token" if token or core.DISCOGS_PROBLEM else "Link Discogs account")
+        self.dg_unlink_btn.setVisible(bool(token or core.DISCOGS_PROBLEM))
 
     def link_discogs(self):
         if DiscogsLinkDialog(self, self.main).exec():
@@ -5513,6 +5519,7 @@ def run(con, core_module):
     global core
     core = core_module
     global SYSTEM_PALETTE
+    core.private_files()  # covers, photos and caches saved from here on are yours alone
     app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setApplicationName("Styli")
     app.setDesktopFileName("styli")
