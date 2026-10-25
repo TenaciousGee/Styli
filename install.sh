@@ -1,11 +1,11 @@
 #!/bin/sh
 # Installs Styli for the current user on Linux.
-#   - copies styli.py, styli_gui.py and the styli.png icon to ~/.local/share/styli/app
-#   - creates the `styli` command (and `vt` as a short name) in ~/.local/bin
+#   - copies Styli (styli.py, the styli_app folder and the styli.png icon) to ~/.local/share/styli/app
+#   - creates the `styli` command in ~/.local/bin
 #   - adds Styli to your applications menu
 #   - moves a library from the app's earlier name (vinyltrack) across, if there is one
 #   - checks for PyQt6 (needed for the window) and keyring (optional, keeps a Discogs token safe)
-# Run it from the folder containing those three files:  sh install.sh
+# Run it from the folder containing those files:  sh install.sh
 # Running it again updates Styli in place; your library and settings are never touched.
 set -e  # stop at the first thing that fails
 
@@ -15,18 +15,30 @@ data="${XDG_DATA_HOME:-$HOME/.local/share}"
 dest="$data/styli/app"
 bin="$HOME/.local/bin"
 
-# Copy the program and icon, and make the `styli` and `vt` commands point at it.
+# Copy the program and icon, and make the `styli` command point at it.
+if [ ! -f "$here/styli_app/__init__.py" ]; then
+  echo "The styli_app folder wasn't found next to install.sh. Download the whole project and try again."
+  exit 1
+fi
 mkdir -p "$dest" "$bin"
-cp "$here/styli.py" "$here/styli_gui.py" "$dest/"
+rm -rf "$dest/styli_app" "$dest/__pycache__"   # replaced as a whole, so no old modules are left behind
+rm -f "$dest/styli_gui.py"                      # the window lived in this one file before version 1.11
+cp "$here/styli.py" "$dest/"
+cp -R "$here/styli_app" "$dest/"
+find "$dest/styli_app" -name "__pycache__" -type d -prune -exec rm -rf {} +
 if [ -f "$here/styli.png" ]; then
   cp "$here/styli.png" "$dest/"
 else
   echo "Note: styli.png wasn't found next to install.sh, so the menu will use a stock icon."
 fi
-chmod +x "$dest/styli.py" "$dest/styli_gui.py"
+chmod +x "$dest/styli.py"
 ln -sf "$dest/styli.py" "$bin/styli"
-ln -sf "$dest/styli.py" "$bin/vt"
-echo "Installed the styli command to $bin/styli (vt still works too)"
+echo "Installed the styli command to $bin/styli"
+
+# Earlier versions also made a `vt` short name. Remove it, but only if it's Styli's own link.
+if [ -L "$bin/vt" ] && [ "$(readlink "$bin/vt")" = "$dest/styli.py" ]; then
+  rm -f "$bin/vt"
+fi
 
 # ~/.local/bin has to be on your PATH for the commands to work from a terminal.
 case ":$PATH:" in
