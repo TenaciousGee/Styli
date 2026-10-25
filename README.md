@@ -15,7 +15,21 @@ Every stylus wears out. Manufacturers give a rated life in hours, but few of us 
 
 Along the way it builds a picture of your listening: what you play most, when in the week you play, and how your listening has changed over the life of each stylus.
 
+![The main window: main window look and feel](docs/screenshots/main.png)
+
+![The library track listing: list of albums added to local library](docs/screenshots/tracklisting.png)
+
+![Discogs library: if you have a collection on your Discogs account, it will show here](docs/screenshots/discogs.png)
+
 ![The Stats tab: lifetime chart, sides played each week and the weekly heatmap](docs/screenshots/stats.png)
+
+![The top 10: most played albums](docs/screenshots/top10.png)
+
+![The cartridge manager: To manage all your cartridge swapping needs](docs/screenshots/cartridge_manager.png)
+
+![Preferences: Colour picker, light/dark mode, album covers, Discogs link](docs/screenshots/preferences.png)
+
+
 
 ## Contents
 
